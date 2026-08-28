@@ -28,9 +28,9 @@ pub(super) fn state_payload(stats: &Sanitized) -> serde_json::Value {
 
 /// Everything that varies between the sensors announced to Home Assistant.
 ///
-/// A struct rather than more positional arguments: with `state_class` and
-/// `precision` added, a closure would take eight parameters, five of them
-/// `Option<&str>`, and every call site would be an unreadable run of `None`s.
+/// A struct rather than positional arguments: a closure would take nine
+/// parameters, most of them `Option<&str>`, and every call site would be an
+/// unreadable run of `None`s.
 pub(super) struct SensorSpec {
     object_id: &'static str,
     name: &'static str,
@@ -38,8 +38,7 @@ pub(super) struct SensorSpec {
     unit: Option<&'static str>,
     device_class: Option<&'static str>,
     /// Drives Home Assistant's long-term statistics. Without it a sensor is
-    /// recorded in history but never aggregated, so none of these entities had
-    /// any long-term data at all.
+    /// recorded in history but never aggregated.
     state_class: Option<&'static str>,
     /// Display only — the state itself is already rounded to the bike's
     /// resolution when the payload is built.
@@ -200,11 +199,6 @@ pub(super) const SENSORS: &[SensorSpec] = &[
 ///
 /// Device discovery (`<prefix>/device/<node_id>/config` with a `components`
 /// map; Home Assistant 2024.11+) rather than one retained topic per entity.
-/// Issue #5 recorded why that was not worth a migration for a single bike; the
-/// per-bike devices of issue #6 are brand-new node ids with nothing to migrate
-/// from, so they were made device-based from their first publish. The
-/// per-entity topics of releases before per-bike devices are cleared by hand —
-/// see the README.
 ///
 /// `state_topic`, `availability` and `availability_mode` are shared at the
 /// root and inherited by every component; `expire_after` is a per-entity
@@ -257,9 +251,8 @@ pub(super) fn discovery_message(topics: &Topics, bike_id: BikeId) -> (String, se
             "name": "Paused",
             "unique_id": format!("{}_paused", node_id),
             "value_template": "{{ 'ON' if value_json.is_paused else 'OFF' }}",
-            // Same expiry as the sensors. Without it this entity stayed live
-            // while every sensor went unavailable, so the device contradicted
-            // itself about whether the bike was reachable.
+            // Same expiry as the sensors, so the device cannot contradict
+            // itself about reachability.
             "expire_after": EXPIRE_AFTER_SECS,
         }),
     );
@@ -327,10 +320,10 @@ mod tests {
     #[test]
     fn given_the_real_capture_when_the_state_payload_is_serialized_then_it_carries_no_float_noise()
     {
-        // End to end from the bytes doc/sample-data.md actually captured, since
-        // the symptom in issue #2 is a string Home Assistant renders verbatim:
-        // cadence 502 -> 50.2 rpm and distance 1 -> 0.1 km used to serialize as
-        // 50.20000076293945 and 0.10000000149011612.
+        // End to end from the bytes doc/sample-data.md actually captured,
+        // because the state is a string Home Assistant renders verbatim:
+        // cadence 502 -> 50.2 rpm and distance 1 -> 0.1 km would otherwise
+        // serialize as 50.20000076293945 and 0.10000000149011612.
         let mut stats = crate::keiser::parse(&hex!("0624ff00f60100001b0002000033018008"))
             .expect("the captured packet should parse");
         stats.is_paused = false; // so sanitizing keeps the 50.2 rpm this test is about
@@ -362,9 +355,8 @@ mod tests {
     /// The bike every discovery test announces.
     #[test]
     fn given_config_when_the_discovery_message_is_built_then_it_is_one_device_topic_per_bike() {
-        // Issue #5: device-based discovery, one retained topic per bike
-        // carrying every entity. Issue #6: the node id, topics and unique ids
-        // all carry the padded bike id.
+        // One retained topic per bike carrying every entity; the node id,
+        // topics and unique ids all carry the padded bike id.
         let (topic, payload) = device_discovery();
 
         assert_eq!(topic, "homeassistant/device/m3i-ha-bridge-042/config");
@@ -452,8 +444,8 @@ mod tests {
 
     #[test]
     fn given_the_paused_binary_sensor_when_announced_then_it_expires_with_the_others() {
-        // It used to have no expire_after, so it stayed live while every sensor
-        // went unavailable and the device contradicted itself.
+        // Without it the binary sensor stays live while every sensor expires,
+        // and the device contradicts itself about reachability.
         assert_eq!(discovery_for("paused")["expire_after"], EXPIRE_AFTER_SECS);
     }
 
@@ -596,8 +588,6 @@ mod tests {
     fn given_the_sensors_when_announced_then_unique_ids_are_unchanged_and_distinct() {
         // unique_id is what ties a discovery config to an existing entity, so
         // changing one would silently orphan the old entity and its history.
-        // Issue #6 changed them all deliberately (one device per bike); this
-        // pins the new form so it does not drift again by accident.
         let ids: Vec<String> = SENSORS
             .iter()
             .map(|spec| {

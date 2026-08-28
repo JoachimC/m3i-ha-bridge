@@ -42,7 +42,7 @@ impl BlePlatform {
 
     /// A scanner for one bridge attempt. Cheap to make: on Linux it clones the
     /// shared session rather than opening a new D-Bus connection, so the retry
-    /// loop no longer reconnects on every attempt.
+    /// loop does not reconnect on every attempt.
     #[cfg(target_os = "linux")]
     pub fn scanner(&self) -> PlatformScanner {
         PlatformScanner::with_session(self.session.clone())

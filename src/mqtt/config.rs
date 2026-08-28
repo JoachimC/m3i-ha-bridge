@@ -21,8 +21,8 @@ pub struct MqttConfig {
 }
 
 impl MqttConfig {
-    /// Reads configuration from the environment. Returns `None` when `MQTT_HOST`
-    /// is unset, which disables MQTT publishing entirely.
+    /// `None` when `MQTT_HOST` is unset, which disables MQTT publishing
+    /// entirely.
     pub fn from_env() -> Option<Self> {
         Self::from_lookup(
             |key| std::env::var(key).ok(),

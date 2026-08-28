@@ -285,9 +285,9 @@ mod tests {
     #[test]
     fn given_the_keiser_manufacturer_id_when_read_then_it_is_the_sig_assigned_value() {
         // 0x0102 is Keiser Corporation in the Bluetooth SIG company_identifiers
-        // registry. Pinned because widening this back out is what issue #16 was
-        // about: 0x0201 is AR Timing, 0x01AA Geophysical Technology, 0x015E
-        // Unikey Technologies.
+        // registry. Pinned because widening it decodes unrelated devices:
+        // 0x0201 is AR Timing, 0x01AA Geophysical Technology, 0x015E Unikey
+        // Technologies.
         assert_eq!(MANUFACTURER_ID, 0x0102);
     }
 
@@ -295,10 +295,10 @@ mod tests {
     async fn given_a_bridge_attempt_ends_when_its_sender_clone_drops_then_the_channel_stays_open() {
         // `bridge_loop` calls `run_bridge` again after every failure, handing
         // each attempt its own clone of the sender. That is only sound because
-        // a watch channel closes when the *last* sender drops, not the first —
-        // the property the removed `Arc` used to provide. Moving the sender
-        // into `run_bridge` instead of cloning would leave every restart
-        // publishing into a closed channel, with both consumers already gone.
+        // a watch channel closes when the *last* sender drops, not the first.
+        // Moving the sender into `run_bridge` instead of cloning would leave
+        // every restart publishing into a closed channel, with both consumers
+        // already gone.
         let (stats_tx, mut stats_rx) = crate::stats::fleet_channel();
 
         let attempt = stats_tx.clone();
@@ -346,10 +346,10 @@ mod tests {
 
     #[test]
     fn given_a_foreign_manufacturer_id_when_filtered_then_nothing_is_returned() {
-        // The three ids removed by issue #16. A device advertising a
-        // structurally plausible payload under any of them must no longer be
-        // decoded as a bike — 0x0201 in particular can never occur, because
-        // BlueZ decodes the on-air `02 01` prefix to 0x0102 and strips it.
+        // Three foreign ids that must not be decoded as a bike, however
+        // plausible the payload — 0x0201 in particular can never occur,
+        // because BlueZ decodes the on-air `02 01` prefix to 0x0102 and strips
+        // it.
         for manufacturer_id in [0x0201, 0x01AA, 0x015E] {
             assert!(
                 keiser_stats_from(&manufacturer_data(manufacturer_id, &LIVE_CAPTURE), None)
