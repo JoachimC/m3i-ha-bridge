@@ -188,7 +188,7 @@ Topics published, per bike heard (`<id>` is the zero-padded bike id, e.g. `042`)
 * `<prefix>/<id>/state` — JSON payload with `power`, `cadence`, `heart_rate`, `gear`, `distance`, `energy`, `elapsed_seconds`, `is_paused`, `bike_id`, published whenever the data changes. Live metrics are zeroed when the bike pauses or data goes stale.
 * `<prefix>/<id>/availability` — `online` while that bike's readings are fresh, `offline` (retained) once they go stale, so a bike that is switched off greys out in Home Assistant on its own.
 * `<prefix>/availability` — whether the *bridge* is running: `online`/`offline` (retained, with MQTT Last Will for ungraceful disconnects). Every entity requires both this and its bike's topic to say `online`.
-* `homeassistant/(binary_)sensor/m3i-ha-bridge-<id>/<entity>/config` — retained Home Assistant discovery configs, published the first time a bike is heard and again on every reconnect. No YAML needed on the HA side; entities appear under a "Keiser M3i #042" device.
+* `homeassistant/device/m3i-ha-bridge-<id>/config` — one retained Home Assistant device-discovery config per bike carrying every entity, published the first time a bike is heard and again on every reconnect. No YAML needed on the HA side; entities appear under a "Keiser M3i #042" device. Device-based discovery needs **Home Assistant 2024.11 or newer**.
 
 Every sensor declares a `state_class`, so Home Assistant keeps long-term statistics for all of them:
 
@@ -208,7 +208,7 @@ Entities are named by the device: each config announces a short name ("Power") p
 
 #### Upgrading from a release before per-bike devices
 
-Older releases published one device, "Keiser M3i", under the node id `m3i` (the topic prefix) with state on `m3i/state`. Those retained discovery configs are not removed automatically, so the old device stays in Home Assistant as *unavailable* next to the new `Keiser M3i #042` one. To remove it, do these steps once:
+Older releases published one device, "Keiser M3i", as one retained config per entity under the node id `m3i` (the topic prefix), with state on `m3i/state`. Those retained configs are not removed automatically, so the old device stays in Home Assistant as *unavailable* next to the new `Keiser M3i #042` one. To remove it, do these steps once:
 
 1. In Home Assistant, open **Settings → Devices & services → MQTT**, select the old **Keiser M3i** device, and delete it.
 2. Clear the retained configs on the broker, so the device does not come back on the next Home Assistant restart. With the Mosquitto add-on or `mosquitto_pub`, publish an empty retained message to each old topic:
@@ -222,7 +222,7 @@ Older releases published one device, "Keiser M3i", under the node id `m3i` (the 
 
 History recorded against the old entity ids is not carried over.
 
-`total_increasing` is the right class for distance and energy because both accumulate through a ride and reset to zero on the next one. The `kcal` unit on an `energy` device class requires **Home Assistant 2024.10 or newer**; on anything older that entity is rejected at discovery. If you need to support an older release, drop `device_class` from the energy sensor in `src/mqtt_publisher.rs` — long-term statistics come from the state class alone.
+`total_increasing` is the right class for distance and energy because both accumulate through a ride and reset to zero on the next one. The `kcal` unit on an `energy` device class requires Home Assistant 2024.10 or newer; device-based discovery (above) raises the floor to **2024.11**, so that is the minimum supported release.
 
 ## Deployment
 

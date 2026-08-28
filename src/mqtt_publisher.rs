@@ -25,14 +25,14 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// channel, where `try_publish` only succeeds if the event loop happens to be
 /// parked at that exact instant.
 ///
-/// Sized for two bursts at the worst case — every ordinal id 0–200 heard —
-/// because a flapping connection announces twice in quick succession. flume
-/// grows its queue on demand, so the bound costs nothing until it is used.
-const REQUEST_CHANNEL_CAPACITY: usize = 2 * (1 + MAX_BIKES * DISCOVERY_MESSAGES_PER_BIKE);
+/// Sized for two bursts at the worst case — every ordinal id 0–200 heard,
+/// one device-discovery message each — because a flapping connection
+/// announces twice in quick succession, plus one state publish per bike that
+/// may be queued in between. flume grows its queue on demand, so the bound
+/// costs nothing until it is used.
+const REQUEST_CHANNEL_CAPACITY: usize = 2 * (1 + MAX_BIKES) + MAX_BIKES;
 /// Ordinal ids run 0–200 (see `doc/bluetooth-protocol.md`).
 const MAX_BIKES: usize = 201;
-/// [`SENSORS`] plus the `paused` binary sensor.
-const DISCOVERY_MESSAGES_PER_BIKE: usize = SENSORS.len() + 1;
 /// Hard bound on the shutdown handshake: queue the retained `offline` message,
 /// wait for the broker to acknowledge it, then DISCONNECT.
 ///
@@ -198,14 +198,12 @@ impl BikePublisher {
                     },
                 );
                 self.known_bikes.lock().unwrap().insert(bike_id);
-                discovery_messages(&self.config, bike_id)
-                    .into_iter()
-                    .map(|(topic, payload)| OutgoingMessage {
-                        topic,
-                        payload: payload.to_string(),
-                        retain: true,
-                    })
-                    .collect()
+                let (topic, payload) = discovery_message(&self.config, bike_id);
+                vec![OutgoingMessage {
+                    topic,
+                    payload: payload.to_string(),
+                    retain: true,
+                }]
             }
         }
     }
@@ -614,12 +612,12 @@ async fn finish_shutdown(eventloop: &mut EventLoop, client: &AsyncClient, offlin
     }
 }
 
-/// Publishes the bridge's availability and the Home Assistant discovery
-/// configs of every bike heard so far, returning how many messages were queued.
+/// Publishes the bridge's availability and the Home Assistant device-discovery
+/// config of every bike heard so far, returning how many messages were queued.
 ///
-/// A bike's configs are first published by the state loop the moment it is
-/// heard; this repeats them on every reconnect, because anything queued for
-/// the old connection is gone and a retained config the broker never received
+/// A bike's config is first published by the state loop the moment it is
+/// heard; this repeats it on every reconnect, because anything queued for the
+/// old connection is gone and a retained config the broker never received
 /// stays missing.
 ///
 /// Runs inside the connection driver, which is the only task polling the event
@@ -647,11 +645,10 @@ fn announce(client: &AsyncClient, config: &MqttConfig, bikes: &BTreeSet<u8>) -> 
     }
 
     for &bike_id in bikes {
-        for (topic, payload) in discovery_messages(config, bike_id) {
-            match client.try_publish(topic, QoS::AtLeastOnce, true, payload.to_string()) {
-                Ok(()) => queued += 1,
-                Err(e) => tracing::warn!("Failed to publish MQTT discovery config: {}", e),
-            }
+        let (topic, payload) = discovery_message(config, bike_id);
+        match client.try_publish(topic, QoS::AtLeastOnce, true, payload.to_string()) {
+            Ok(()) => queued += 1,
+            Err(e) => tracing::warn!("Failed to publish MQTT discovery config: {}", e),
         }
     }
 
@@ -831,16 +828,30 @@ const SENSORS: &[SensorSpec] = &[
     },
 ];
 
-/// Home Assistant MQTT discovery messages: one retained config per entity, so
-/// sensors appear automatically without any YAML on the HA side.
+/// Home Assistant device-based MQTT discovery: one retained config per bike
+/// carrying every entity, so sensors appear automatically without any YAML on
+/// the HA side.
+///
+/// Device discovery (`<prefix>/device/<node_id>/config` with a `components`
+/// map; Home Assistant 2024.11+) rather than one retained topic per entity.
+/// Issue #5 recorded why that was not worth a migration for a single bike; the
+/// per-bike devices of issue #6 are brand-new node ids with nothing to migrate
+/// from, so they were made device-based from their first publish. The
+/// per-entity topics of releases before per-bike devices are cleared by hand —
+/// see the README.
+///
+/// `state_topic`, `availability` and `availability_mode` are shared at the
+/// root and inherited by every component; `expire_after` is a per-entity
+/// option and so is repeated in each. `device` and `origin` are mandatory
+/// here, not merely recommended.
 ///
 /// # Entity naming
 ///
-/// Each sensor announces a short `name` ("Power") plus the `device` block, and
-/// Home Assistant composes the two: friendly name "Keiser M3i #042 Power",
-/// entity id `sensor.keiser_m3i_042_power`. There is no bare `sensor.power` to
-/// collide with anything else on the instance, and two bikes never collide with
-/// each other.
+/// Each component announces a short `name` ("Power") plus the shared `device`
+/// block, and Home Assistant composes the two: friendly name "Keiser M3i #042
+/// Power", entity id `sensor.keiser_m3i_042_power`. There is no bare
+/// `sensor.power` to collide with anything else on the instance, and two bikes
+/// never collide with each other.
 ///
 /// Do **not** add `"has_entity_name": true` to these payloads. It is not an
 /// MQTT discovery option — the MQTT integration sets `_attr_has_entity_name`
@@ -848,15 +859,7 @@ const SENSORS: &[SensorSpec] = &[
 /// discovery schema uses `extra=vol.REMOVE_EXTRA`, so the key is silently
 /// discarded. Adding it would look like it did something while changing
 /// nothing.
-///
-/// Device-based discovery (a single `<prefix>/device/<node_id>/config` topic
-/// carrying a `cmps` component map, Home Assistant 2024.11+) would collapse
-/// these eight retained topics into one. Deliberately not adopted: the saving
-/// is eight retained messages on a private broker, it would raise the minimum
-/// Home Assistant version for no user-visible gain, and migrating requires a
-/// documented three-phase handshake that a stateless reconnect-and-announce
-/// publisher cannot perform idempotently.
-fn discovery_messages(config: &MqttConfig, bike_id: u8) -> Vec<(String, serde_json::Value)> {
+fn discovery_message(config: &MqttConfig, bike_id: u8) -> (String, serde_json::Value) {
     let node_id = MqttConfig::node_id(bike_id);
     let device = json!({
         "identifiers": [format!("m3i_ha_bridge_{}", bike_id_label(bike_id))],
@@ -871,27 +874,22 @@ fn discovery_messages(config: &MqttConfig, bike_id: u8) -> Vec<(String, serde_js
         { "topic": config.bridge_availability_topic() },
         { "topic": config.bike_availability_topic(bike_id) },
     ]);
-    // Only recommended for per-entity discovery, but mandatory if this ever
-    // moves to device-based discovery, so it costs nothing to add now.
     let origin = json!({
         "name": env!("CARGO_PKG_NAME"),
         "sw_version": env!("CARGO_PKG_VERSION"),
         "support_url": "https://github.com/JoachimC/m3i-ha-bridge",
     });
 
-    let sensor = |spec: &SensorSpec| {
-        let mut payload = json!({
+    let mut components = serde_json::Map::new();
+    for spec in SENSORS {
+        let mut component = json!({
+            "platform": "sensor",
             "name": spec.name,
             "unique_id": format!("{}_{}", node_id, spec.object_id),
-            "state_topic": config.state_topic(bike_id),
             "value_template": spec.value_template,
-            "availability": availability,
-            "availability_mode": "all",
             "expire_after": EXPIRE_AFTER_SECS,
-            "device": device,
-            "origin": origin,
         });
-        let obj = payload.as_object_mut().unwrap();
+        let obj = component.as_object_mut().unwrap();
         if let Some(unit) = spec.unit {
             obj.insert("unit_of_measurement".into(), json!(unit));
         }
@@ -910,39 +908,33 @@ fn discovery_messages(config: &MqttConfig, bike_id: u8) -> Vec<(String, serde_js
         if let Some(entity_category) = spec.entity_category {
             obj.insert("entity_category".into(), json!(entity_category));
         }
-        (
-            format!(
-                "{}/sensor/{}/{}/config",
-                config.discovery_prefix, node_id, spec.object_id
-            ),
-            payload,
-        )
-    };
-
-    let mut messages: Vec<(String, serde_json::Value)> = SENSORS.iter().map(sensor).collect();
-
-    messages.push((
-        format!(
-            "{}/binary_sensor/{}/paused/config",
-            config.discovery_prefix, node_id
-        ),
+        components.insert(spec.object_id.to_string(), component);
+    }
+    components.insert(
+        "paused".to_string(),
         json!({
+            "platform": "binary_sensor",
             "name": "Paused",
             "unique_id": format!("{}_paused", node_id),
-            "state_topic": config.state_topic(bike_id),
             "value_template": "{{ 'ON' if value_json.is_paused else 'OFF' }}",
-            "availability": availability,
-            "availability_mode": "all",
             // Same expiry as the sensors. Without it this entity stayed live
             // while every sensor went unavailable, so the device contradicted
             // itself about whether the bike was reachable.
             "expire_after": EXPIRE_AFTER_SECS,
+        }),
+    );
+
+    (
+        format!("{}/device/{}/config", config.discovery_prefix, node_id),
+        json!({
             "device": device,
             "origin": origin,
+            "state_topic": config.state_topic(bike_id),
+            "availability": availability,
+            "availability_mode": "all",
+            "components": components,
         }),
-    ));
-
-    messages
+    )
 }
 
 #[cfg(test)]
@@ -1238,50 +1230,73 @@ mod tests {
     const BIKE: u8 = 42;
 
     #[test]
-    fn given_config_when_discovery_messages_are_built_then_topics_and_links_are_correct() {
-        // Issue #6: one device per bike, so the node id, topics and unique ids
+    fn given_config_when_the_discovery_message_is_built_then_it_is_one_device_topic_per_bike() {
+        // Issue #5: device-based discovery, one retained topic per bike
+        // carrying every entity. Issue #6: the node id, topics and unique ids
         // all carry the padded bike id.
-        let vars = HashMap::from([("MQTT_HOST", "broker.local")]);
-        let config = config_from(&vars, &HashMap::new()).unwrap();
-        let messages = discovery_messages(&config, BIKE);
+        let (topic, payload) = device_discovery();
 
-        let (power_topic, power_payload) = messages
-            .iter()
-            .find(|(topic, _)| topic.ends_with("/power/config"))
-            .unwrap();
+        assert_eq!(topic, "homeassistant/device/m3i-ha-bridge-042/config");
+        assert_eq!(payload["state_topic"], "m3i/042/state");
+        let components = payload["components"].as_object().unwrap();
+        assert_eq!(components.len(), SENSORS.len() + 1);
+        assert_eq!(components["power"]["platform"], "sensor");
+        assert_eq!(components["power"]["unique_id"], "m3i-ha-bridge-042_power");
+        assert_eq!(components["paused"]["platform"], "binary_sensor");
         assert_eq!(
-            power_topic,
-            "homeassistant/sensor/m3i-ha-bridge-042/power/config"
+            components["paused"]["unique_id"],
+            "m3i-ha-bridge-042_paused"
         );
-        assert_eq!(power_payload["state_topic"], "m3i/042/state");
-        assert_eq!(power_payload["unique_id"], "m3i-ha-bridge-042_power");
-
-        assert!(messages.iter().any(|(topic, _)| {
-            topic == "homeassistant/binary_sensor/m3i-ha-bridge-042/paused/config"
-        }));
     }
 
     #[test]
-    fn given_a_discovery_message_when_announced_then_it_requires_both_bridge_and_bike_online() {
+    fn given_the_discovery_message_when_built_then_the_shared_options_are_at_the_root_only() {
+        // Device discovery inherits state_topic and availability from the
+        // root; repeating them per component would be redundant and, for
+        // device/origin, is not permitted at all.
+        let (_, payload) = device_discovery();
+        for (object_id, component) in payload["components"].as_object().unwrap() {
+            for shared in [
+                "state_topic",
+                "availability",
+                "availability_mode",
+                "device",
+                "origin",
+            ] {
+                assert!(
+                    component.get(shared).is_none(),
+                    "{object_id} repeats the shared option {shared}"
+                );
+            }
+            assert!(
+                component.get("platform").is_some(),
+                "{object_id} must name its platform"
+            );
+            assert_eq!(
+                component["expire_after"], EXPIRE_AFTER_SECS,
+                "{object_id}: expire_after is per entity, not shared"
+            );
+        }
+    }
+
+    #[test]
+    fn given_the_discovery_message_when_built_then_it_requires_both_bridge_and_bike_online() {
         // The bridge topic carries the last will; the bike topic goes offline
         // when that bike's readings go stale. An entity is only available when
         // both say so, otherwise a dead bridge would leave a bike "online".
-        for object_id in ["power", "paused"] {
-            let payload = discovery_for(object_id);
-            assert_eq!(
-                payload["availability"],
-                json!([
-                    { "topic": "m3i/availability" },
-                    { "topic": "m3i/042/availability" },
-                ]),
-                "{object_id}"
-            );
-            assert_eq!(payload["availability_mode"], "all", "{object_id}");
-            assert!(
-                payload.get("availability_topic").is_none(),
-                "{object_id}: availability_topic and availability are mutually exclusive"
-            );
-        }
+        let (_, payload) = device_discovery();
+        assert_eq!(
+            payload["availability"],
+            json!([
+                { "topic": "m3i/availability" },
+                { "topic": "m3i/042/availability" },
+            ])
+        );
+        assert_eq!(payload["availability_mode"], "all");
+        assert!(
+            payload.get("availability_topic").is_none(),
+            "availability_topic and availability are mutually exclusive"
+        );
     }
 
     #[test]
@@ -1318,15 +1333,19 @@ mod tests {
         }
     }
 
-    fn discovery_for(object_id: &str) -> serde_json::Value {
+    fn device_discovery() -> (String, serde_json::Value) {
         let vars = HashMap::from([("MQTT_HOST", "broker.local")]);
         let config = config_from(&vars, &HashMap::new()).unwrap();
-        let suffix = format!("/{object_id}/config");
-        discovery_messages(&config, BIKE)
-            .into_iter()
-            .find(|(topic, _)| topic.ends_with(&suffix))
-            .unwrap_or_else(|| panic!("no discovery message for {object_id}"))
-            .1
+        discovery_message(&config, BIKE)
+    }
+
+    /// One entity's component of the device discovery payload.
+    fn discovery_for(object_id: &str) -> serde_json::Value {
+        let (_, payload) = device_discovery();
+        payload["components"]
+            .get(object_id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no discovery component for {object_id}"))
     }
 
     fn reading_from(bike_id: u8, power: u16) -> KeiserStats {
@@ -1367,16 +1386,11 @@ mod tests {
         let mut publisher = publisher();
         let messages = publisher.observe(reading_from(BIKE, 150));
 
+        assert_eq!(messages.len(), 1, "one device-discovery message per bike");
+        assert!(messages[0].retain);
         assert_eq!(
-            messages.len(),
-            discovery_messages(&test_config(), BIKE).len()
-        );
-        assert!(messages.iter().all(|m| m.retain));
-        assert!(
-            messages
-                .iter()
-                .all(|m| m.topic.contains("/m3i-ha-bridge-042/")),
-            "every config belongs to this bike's node"
+            messages[0].topic, "homeassistant/device/m3i-ha-bridge-042/config",
+            "the config belongs to this bike's node"
         );
         assert_eq!(
             *publisher.known_bikes.lock().unwrap(),
@@ -1548,7 +1562,7 @@ mod tests {
 
         let queued = announce(&client, &config, &BTreeSet::from([BIKE]));
 
-        let expected = 1 + discovery_messages(&config, BIKE).len(); // availability + configs
+        let expected = 2; // availability + one device config
         assert_eq!(queued, expected, "announce should report what it queued");
         let publishes = queued_publishes(&rx);
         assert_eq!(publishes.len(), expected);
@@ -1571,12 +1585,12 @@ mod tests {
         // devices (issue #6) the burst scales with the bikes in range, and the
         // old capacity of 64 overflowed at four bikes.
         let bikes: BTreeSet<u8> = (0..=200).collect();
-        let per_bike = discovery_messages(&config, BIKE).len();
         assert_eq!(
-            per_bike, DISCOVERY_MESSAGES_PER_BIKE,
-            "the constant must track the real count"
+            bikes.len(),
+            MAX_BIKES,
+            "the constant must track the id range"
         );
-        let burst = 1 + bikes.len() * per_bike;
+        let burst = 1 + bikes.len();
         assert!(
             burst <= REQUEST_CHANNEL_CAPACITY,
             "an announce burst of {burst} cannot fit a channel of {REQUEST_CHANNEL_CAPACITY}"
@@ -1598,7 +1612,7 @@ mod tests {
         let (client, _rx) = test_client(3);
 
         assert_eq!(
-            announce(&client, &config, &BTreeSet::from([BIKE])),
+            announce(&client, &config, &BTreeSet::from([1, 2, 3, 4])),
             3,
             "only what fits is queued"
         );
@@ -1965,27 +1979,17 @@ mod tests {
         // sensor.power: it prefixes the entity name with the device name. A
         // long name like "Keiser M3i Power" here would produce
         // sensor.keiser_m3i_042_keiser_m3i_power instead.
+        let (_, payload) = device_discovery();
+        assert_eq!(payload["device"]["name"], "Keiser M3i #042");
+        assert_eq!(
+            payload["device"]["identifiers"],
+            json!(["m3i_ha_bridge_042"])
+        );
         for spec in SENSORS {
-            let payload = discovery_for(spec.object_id);
-            assert_eq!(
-                payload["device"]["name"], "Keiser M3i #042",
-                "{}",
-                spec.object_id
-            );
-            assert_eq!(
-                payload["device"]["identifiers"],
-                json!(["m3i_ha_bridge_042"]),
-                "{}",
-                spec.object_id
-            );
+            let component = discovery_for(spec.object_id);
             assert!(
-                !payload["name"].as_str().unwrap().contains("Keiser"),
+                !component["name"].as_str().unwrap().contains("Keiser"),
                 "{} repeats the device name in its entity name",
-                spec.object_id
-            );
-            assert!(
-                payload["device"]["identifiers"].is_array(),
-                "{} must belong to a device for the naming to apply",
                 spec.object_id
             );
         }
@@ -2014,7 +2018,8 @@ mod tests {
 
     #[test]
     fn given_a_discovery_message_when_announced_then_it_names_its_origin() {
-        let payload = discovery_for("power");
+        // Mandatory for device discovery, not merely recommended.
+        let (_, payload) = device_discovery();
         assert_eq!(payload["origin"]["name"], "m3i-ha-bridge");
         assert_eq!(payload["origin"]["sw_version"], env!("CARGO_PKG_VERSION"));
     }
@@ -2051,13 +2056,13 @@ mod tests {
             ("MQTT_TOPIC_PREFIX", "fitness/m3i"),
         ]);
         let config = config_from(&vars, &HashMap::new()).unwrap();
-        for (topic, _) in discovery_messages(&config, BIKE) {
-            // HA discovery topics must be exactly <prefix>/<component>/<node_id>/<object_id>/config
-            assert_eq!(
-                topic.split('/').count(),
-                5,
-                "unexpected topic depth: {topic}"
-            );
-        }
+        let (topic, _) = discovery_message(&config, BIKE);
+        // A device discovery topic is exactly <prefix>/device/<node_id>/config;
+        // the node id is fixed, so the topic prefix cannot leak a slash into it.
+        assert_eq!(
+            topic.split('/').count(),
+            4,
+            "unexpected topic depth: {topic}"
+        );
     }
 }
