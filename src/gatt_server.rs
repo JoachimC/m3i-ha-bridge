@@ -9,10 +9,9 @@ mod linux_impl {
     use crate::gatt_codec::{
         AdvertisedIdTracker, FTMS_FEATURE_VALUE, LEGACY_ADVERTISING_CAPACITY, NewArrivals,
         cps_has_value, ftms_has_value, hrs_has_value, initial_notification,
-        legacy_advertising_size, local_name, serial_number, serialize_cps, serialize_ftms,
-        serialize_hrs, wrap_u16,
+        legacy_advertising_size, serialize_cps, serialize_ftms, serialize_hrs, wrap_u16,
     };
-    use crate::stats::{Fleet, KeiserStats, current_snapshot, next_snapshot};
+    use crate::stats::{BikeId, Fleet, Sanitized, current_snapshot, next_snapshot};
     use bluer::{
         adv::{Advertisement, AdvertisementHandle},
         gatt::local::{
@@ -116,12 +115,12 @@ mod linux_impl {
     fn spawn_notify_loop<F>(
         name: &'static str,
         mut rx: watch::Receiver<Arc<Fleet>>,
-        advertised_id: watch::Receiver<Option<u8>>,
+        advertised_id: watch::Receiver<Option<BikeId>>,
         mut notifier: CharacteristicNotifier,
-        has_value: fn(&KeiserStats) -> bool,
+        has_value: fn(&Sanitized) -> bool,
         mut serialize: F,
     ) where
-        F: FnMut(&KeiserStats) -> Vec<u8> + Send + 'static,
+        F: FnMut(&Sanitized) -> Vec<u8> + Send + 'static,
     {
         tokio::spawn(async move {
             tracing::info!("GATT: Client subscribed to {}", name);
@@ -129,7 +128,8 @@ mod linux_impl {
             // The advertised id is read fresh each time and the guard dropped
             // before any await; the channel is a shared cell here, not a
             // stream.
-            let advertised = |advertised_id: &watch::Receiver<Option<u8>>| *advertised_id.borrow();
+            let advertised =
+                |advertised_id: &watch::Receiver<Option<BikeId>>| *advertised_id.borrow();
 
             let initial = current_snapshot(&mut rx);
             if let Some(reading) = advertised(&advertised_id).and_then(|id| initial.get(&id))
@@ -155,7 +155,7 @@ mod linux_impl {
     /// Builds a serializer for the Cycling Power Measurement characteristic.
     /// CPS is stateful: it must report cumulative crank revolutions and the
     /// last crank event time (1/1024 s), both wrapping at u16 as per spec.
-    fn cps_serializer() -> impl FnMut(&KeiserStats) -> Vec<u8> + Send + 'static {
+    fn cps_serializer() -> impl FnMut(&Sanitized) -> Vec<u8> + Send + 'static {
         let mut cumulative_revolutions: f64 = 0.0;
         let mut last_event_time: f64 = 0.0;
         let mut last_update = tokio::time::Instant::now();
@@ -164,8 +164,8 @@ mod linux_impl {
             let delta_t = now.duration_since(last_update).as_secs_f64();
             last_update = now;
 
-            if stats.cadence > 0.0 {
-                cumulative_revolutions += (stats.cadence as f64 / 60.0) * delta_t;
+            if stats.cadence.is_positive() {
+                cumulative_revolutions += (stats.cadence.as_f64() / 60.0) * delta_t;
                 last_event_time += delta_t * 1024.0;
             }
 
@@ -193,12 +193,12 @@ mod linux_impl {
         uuid: bluer::Uuid,
         name: &'static str,
         stats_rx: watch::Receiver<Arc<Fleet>>,
-        advertised_id: watch::Receiver<Option<u8>>,
-        has_value: fn(&KeiserStats) -> bool,
+        advertised_id: watch::Receiver<Option<BikeId>>,
+        has_value: fn(&Sanitized) -> bool,
         make_serializer: F,
     ) -> Characteristic
     where
-        F: Fn() -> Box<dyn FnMut(&KeiserStats) -> Vec<u8> + Send> + Send + Sync + 'static,
+        F: Fn() -> Box<dyn FnMut(&Sanitized) -> Vec<u8> + Send> + Send + Sync + 'static,
     {
         Characteristic {
             uuid,
@@ -221,13 +221,18 @@ mod linux_impl {
 
     /// Serial Number String: the advertised bike's zero-padded id, read live
     /// so it follows the advertisement when the bridge switches bikes.
-    fn serial_number_characteristic(advertised_id: watch::Receiver<Option<u8>>) -> Characteristic {
+    fn serial_number_characteristic(
+        advertised_id: watch::Receiver<Option<BikeId>>,
+    ) -> Characteristic {
         Characteristic {
             uuid: DIS_SERIAL_NUMBER_CHAR_UUID,
             read: Some(CharacteristicRead {
                 read: true,
                 fun: Box::new(move |_req| {
-                    let serial = serial_number(*advertised_id.borrow());
+                    let serial = advertised_id
+                        .borrow()
+                        .map(|id| id.to_string())
+                        .unwrap_or_default();
                     async move { Ok(serial.into_bytes()) }.boxed()
                 }),
                 ..Default::default()
@@ -238,7 +243,7 @@ mod linux_impl {
 
     fn build_application(
         stats_rx: &watch::Receiver<Arc<Fleet>>,
-        advertised_id: &watch::Receiver<Option<u8>>,
+        advertised_id: &watch::Receiver<Option<BikeId>>,
     ) -> Application {
         Application {
             services: vec![
@@ -509,7 +514,7 @@ mod linux_impl {
             }
 
             if let Some(bike_id) = tracker.take_due(now) {
-                let name = local_name(bike_id);
+                let name = bike_id.display_name();
                 if let Some(previous) = advertisement.take() {
                     tracing::info!("Re-advertising as {:?}", name);
                     unregister_advertisement(previous).await;
@@ -617,7 +622,10 @@ mod linux_impl {
         #[test]
         fn given_the_advertisement_when_sized_then_it_fits_a_legacy_advertising_packet() {
             // Three digits is the widest id, so bike 200 is the longest name.
-            let size = legacy_advertising_size(&local_name(200), advertised_service_uuids().len());
+            let size = legacy_advertising_size(
+                &BikeId(200).display_name(),
+                advertised_service_uuids().len(),
+            );
             assert!(
                 size <= LEGACY_ADVERTISING_CAPACITY,
                 "advertisement needs {size} bytes, over the {LEGACY_ADVERTISING_CAPACITY}-byte \
