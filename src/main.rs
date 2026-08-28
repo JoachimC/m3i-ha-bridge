@@ -25,7 +25,7 @@ mod gatt_codec;
 #[cfg(target_os = "linux")]
 mod gatt_server;
 mod keiser;
-mod mqtt_publisher;
+mod mqtt;
 mod run_status;
 #[cfg(target_os = "linux")]
 mod scan_bluer;
@@ -148,12 +148,12 @@ async fn main() -> Result<(), BoxError> {
     // publisher (BLE GATT, MQTT) consumes its own receiver independently.
     let (stats_tx, stats_rx) = stats::fleet_channel();
 
-    let mqtt_handle = match mqtt_publisher::MqttConfig::from_env() {
+    let mqtt_handle = match mqtt::MqttConfig::from_env() {
         Some(config) => {
             let mqtt_cancel_token = cancel_token.clone();
             let mqtt_stats_rx = stats_tx.subscribe();
             Some(tokio::spawn(async move {
-                mqtt_publisher::run(mqtt_cancel_token, mqtt_stats_rx, config).await
+                mqtt::run(mqtt_cancel_token, mqtt_stats_rx, config).await
             }))
         }
         None => {

@@ -83,7 +83,7 @@ If you develop on a different machine, use `./deploy.sh`. It builds the binary a
 
 ## Architecture
 
-The Bluetooth reader is the single producer: it parses Keiser advertisements into `KeiserStats` (`stats.rs`) and broadcasts them on a `tokio::sync::watch` channel. Each publisher — the BLE GATT server (`gatt_server`) and the MQTT publisher (`mqtt_publisher`) — consumes its own receiver independently, so reading from the bike is fully decoupled from publishing, and a slow or failing destination never blocks the reader or the other destination.
+The Bluetooth reader is the single producer: it parses Keiser advertisements into `KeiserStats` (`stats.rs`) and broadcasts them on a `tokio::sync::watch` channel. Each publisher — the BLE GATT server (`gatt_server`) and the MQTT publisher (`mqtt`) — consumes its own receiver independently, so reading from the bike is fully decoupled from publishing, and a slow or failing destination never blocks the reader or the other destination.
 
 ### Module layout
 
@@ -98,7 +98,7 @@ The Bluetooth reader is the single producer: it parses Keiser advertisements int
 | `advertising.rs` | Which bike the bridge advertises as, when it switches, and what the advertisement contains — platform-independent, behind the `Advertiser` trait |
 | `gatt_codec.rs` | Pure serializers for the FTMS / Cycling Power / Heart Rate GATT payloads |
 | `gatt_server.rs` | BlueZ (`bluer`) GATT server and advertising — Linux only |
-| `mqtt_publisher.rs` | MQTT state publishing and Home Assistant discovery |
+| `mqtt/` | MQTT output: `config` (broker settings), `topics` (naming), `discovery` (what Home Assistant is told), `publisher` (per-bike state and availability), `connection` (the broker driver, announce and shutdown) |
 | `between_retries_strategy.rs` | Pluggable, cancellable retry backoff for the bridge loop |
 
 Protocol parsing (`keiser`), payload serialization (`gatt_codec`) and advertising policy (`advertising`) are deliberately free of Bluetooth-stack dependencies, so they build and unit-test on any platform even though the GATT server itself only runs on Linux.
