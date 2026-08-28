@@ -57,7 +57,10 @@ packet
   Firmware 6.21 is the first build that adds the Gear byte. This is why the
   bridge accepts 6.21 and later.
 - **Data Slot**: Byte 2. If this value is `0xFF`, the bike is paused.
-- **Bike ID**: Byte 3. The ordinal id that is set on the bike (0-200).
+- **Bike ID**: Byte 3. The ordinal id that is set on the bike (0-200). The
+  bridge uses it to name the bike on both outputs: the BLE advertisement
+  and DIS serial number, and the Home Assistant device and topics. See
+  "Bike identity" in the README.
 - **Cadence**: Bytes 4-5. The value is `RPM * 10`, little-endian.
 - **Heart Rate**: Bytes 6-7. The value is `BPM * 10`, little-endian.
 - **Power**: Bytes 8-9. Real-time power in watts, little-endian.

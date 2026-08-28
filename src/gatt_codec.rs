@@ -6,10 +6,77 @@
 //! unit-tested on every platform, even though the GATT server itself only
 //! runs on Linux.
 
-use crate::stats::KeiserStats;
+use std::time::Duration;
 
-/// Name the bridge advertises itself under.
-pub const LOCAL_NAME: &str = "Keiser M3i BLE";
+use tokio::time::Instant;
+
+use crate::stats::{KeiserStats, bike_display_name, bike_id_label};
+
+/// Name the bridge advertises itself under: the bike's display name, so a
+/// pairing screen in Zwift or Garmin shows which bike this is.
+pub fn local_name(bike_id: u8) -> String {
+    bike_display_name(bike_id)
+}
+
+/// The Device Information Service's Serial Number String for a bike: the
+/// zero-padded id, or empty while no bike has been heard.
+pub fn serial_number(bike_id: Option<u8>) -> String {
+    bike_id.map(bike_id_label).unwrap_or_default()
+}
+
+/// How long the latest bike id has to stay the same before the advertisement
+/// is re-registered under it.
+///
+/// Re-registering is not free: BlueZ tears the old advertisement down, and
+/// clients mid-pairing lose the device. In a room where two bikes alternate
+/// packets, the "latest" id flips every couple of seconds; the hold means the
+/// name only changes when a different bike has genuinely taken over.
+pub const ADVERTISED_ID_HOLD: Duration = Duration::from_secs(10);
+
+/// Decides which bike id the advertisement should carry.
+///
+/// The first bike heard is advertised at once — before it there is nothing to
+/// advertise. After that, a different id has to persist for
+/// [`ADVERTISED_ID_HOLD`] before it replaces the advertised one.
+#[derive(Debug, Default)]
+pub struct AdvertisedIdTracker {
+    advertised: Option<u8>,
+    /// The most recent id that differs from the advertised one, and when it
+    /// was first seen.
+    candidate: Option<(u8, Instant)>,
+}
+
+impl AdvertisedIdTracker {
+    /// Records the latest reading's bike id.
+    pub fn observe(&mut self, bike_id: u8, now: Instant) {
+        if self.advertised == Some(bike_id) {
+            self.candidate = None;
+            return;
+        }
+        match self.candidate {
+            Some((id, _)) if id == bike_id => {}
+            _ => self.candidate = Some((bike_id, now)),
+        }
+    }
+
+    /// The id the advertisement should switch to now, if any. Calling this
+    /// commits the switch, so the caller must go on to register it.
+    pub fn take_due(&mut self, now: Instant) -> Option<u8> {
+        let (id, since) = self.candidate?;
+        let due = self.advertised.is_none() || now.duration_since(since) >= ADVERTISED_ID_HOLD;
+        if !due {
+            return None;
+        }
+        self.candidate = None;
+        self.advertised = Some(id);
+        Some(id)
+    }
+
+    #[cfg(test)]
+    pub fn advertised(&self) -> Option<u8> {
+        self.advertised
+    }
+}
 
 /// A legacy (non-extended) BLE advertising packet carries at most 31 bytes of
 /// AD structures. Overrunning it makes BlueZ refuse to register the
@@ -210,10 +277,18 @@ mod tests {
     }
 
     #[test]
+    fn given_a_bike_id_when_the_local_name_is_built_then_it_is_the_bikes_display_name() {
+        // Issue #6: the one place a rider can tell bikes apart in a pairing
+        // list is the advertised name, so it carries the padded id.
+        assert_eq!(local_name(42), "Keiser M3i #042");
+    }
+
+    #[test]
     fn given_the_advertised_services_when_sized_then_the_payload_fits_a_legacy_advertisement() {
-        // Flags (3) + "Keiser M3i BLE" (2 + 14) + two 16-bit UUIDs (2 + 4) = 25.
-        let size = legacy_advertising_size(LOCAL_NAME, 2);
-        assert_eq!(size, 25);
+        // Flags (3) + "Keiser M3i #200" (2 + 15) + two 16-bit UUIDs (2 + 4) = 26.
+        // The widest id is three digits, so 200 is the worst case.
+        let size = legacy_advertising_size(&local_name(200), 2);
+        assert_eq!(size, 26);
         assert!(
             size <= LEGACY_ADVERTISING_CAPACITY,
             "{size} bytes exceeds the {LEGACY_ADVERTISING_CAPACITY}-byte legacy limit; \
@@ -225,7 +300,92 @@ mod tests {
     fn given_a_third_advertised_service_when_sized_then_there_is_still_headroom() {
         // Heart Rate is not advertised today, but knowing it would still fit is
         // what makes that a choice rather than a constraint.
-        assert!(legacy_advertising_size(LOCAL_NAME, 3) <= LEGACY_ADVERTISING_CAPACITY);
+        assert!(legacy_advertising_size(&local_name(200), 3) <= LEGACY_ADVERTISING_CAPACITY);
+    }
+
+    #[test]
+    fn given_no_bike_heard_when_the_serial_number_is_read_then_it_is_empty() {
+        assert_eq!(serial_number(None), "");
+        assert_eq!(serial_number(Some(7)), "007");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_no_advertisement_yet_when_the_first_bike_is_heard_then_it_is_due_at_once() {
+        // Nothing is advertised until a bike is heard, so there is nothing to
+        // protect from thrashing: the first id goes out immediately.
+        let mut tracker = AdvertisedIdTracker::default();
+        let now = Instant::now();
+        tracker.observe(42, now);
+        assert_eq!(tracker.take_due(now), Some(42));
+        assert_eq!(tracker.advertised(), Some(42));
+        assert_eq!(tracker.take_due(now), None, "committed, not repeated");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_different_bike_when_it_has_only_just_appeared_then_nothing_is_due() {
+        let mut tracker = AdvertisedIdTracker::default();
+        let start = Instant::now();
+        tracker.observe(1, start);
+        tracker.take_due(start);
+
+        tracker.observe(2, start);
+        assert_eq!(tracker.take_due(start), None);
+        tokio::time::advance(ADVERTISED_ID_HOLD / 2).await;
+        assert_eq!(tracker.take_due(Instant::now()), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_different_bike_when_it_has_persisted_for_the_hold_then_it_is_due() {
+        let mut tracker = AdvertisedIdTracker::default();
+        let start = Instant::now();
+        tracker.observe(1, start);
+        tracker.take_due(start);
+
+        tracker.observe(2, start);
+        tokio::time::advance(ADVERTISED_ID_HOLD).await;
+        tracker.observe(2, Instant::now());
+        assert_eq!(tracker.take_due(Instant::now()), Some(2));
+        assert_eq!(tracker.advertised(), Some(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_two_bikes_alternating_when_the_hold_elapses_then_the_name_does_not_flip() {
+        // The multi-bike room: packets from bike 1 and bike 2 interleave every
+        // couple of seconds. Bike 2 never holds the "latest" slot for the full
+        // hold, so the advertisement stays on bike 1 rather than thrashing.
+        let mut tracker = AdvertisedIdTracker::default();
+        tracker.observe(1, Instant::now());
+        tracker.take_due(Instant::now());
+
+        for _ in 0..10 {
+            tracker.observe(2, Instant::now());
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert_eq!(tracker.take_due(Instant::now()), None);
+            tracker.observe(1, Instant::now());
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert_eq!(tracker.take_due(Instant::now()), None);
+        }
+        assert_eq!(tracker.advertised(), Some(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_the_advertised_bike_returns_when_a_candidate_was_pending_then_it_is_dropped() {
+        // Seeing the advertised bike again resets the clock: the next time a
+        // different bike appears it has to earn the full hold from scratch.
+        let mut tracker = AdvertisedIdTracker::default();
+        tracker.observe(1, Instant::now());
+        tracker.take_due(Instant::now());
+
+        tracker.observe(2, Instant::now());
+        tokio::time::advance(ADVERTISED_ID_HOLD - Duration::from_secs(1)).await;
+        tracker.observe(1, Instant::now());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tracker.observe(2, Instant::now());
+        assert_eq!(
+            tracker.take_due(Instant::now()),
+            None,
+            "the earlier sighting of bike 2 must not count"
+        );
     }
 
     #[test]
@@ -240,7 +400,7 @@ mod tests {
     fn given_no_advertised_services_when_sized_then_the_uuid_structure_costs_nothing() {
         // An empty AD structure is omitted entirely rather than emitted with a
         // zero-length value.
-        assert_eq!(legacy_advertising_size(LOCAL_NAME, 0), 19);
+        assert_eq!(legacy_advertising_size(&local_name(200), 0), 20);
     }
 
     #[test]

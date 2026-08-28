@@ -57,7 +57,30 @@ pub struct KeiserStats {
     pub last_updated: Option<std::time::Instant>,
 }
 
+/// The bike id as it appears in names and topics: zero-padded to three
+/// digits, so `#7` and `#42` sort and align with `#200`.
+pub fn bike_id_label(bike_id: u8) -> String {
+    format!("{bike_id:03}")
+}
+
+/// The display name of one bike, shared by the BLE advertisement and the Home
+/// Assistant device so a rider sees the same name in Zwift and on the
+/// dashboard.
+pub fn bike_display_name(bike_id: u8) -> String {
+    format!("Keiser M3i #{}", bike_id_label(bike_id))
+}
+
 impl KeiserStats {
+    /// The id of the bike this reading came from, or `None` for the channel's
+    /// initial value before any packet has been received.
+    ///
+    /// Zero is a real ordinal id, so "not known yet" cannot be represented in
+    /// the field itself; it is the absence of a receive timestamp that says no
+    /// packet has ever been parsed.
+    pub fn bike_id(&self) -> Option<u8> {
+        self.last_updated.map(|_| self.bike_id)
+    }
+
     pub fn is_stale(&self) -> bool {
         self.last_updated.is_none_or(|t| t.elapsed() > STALE_AFTER)
     }
@@ -207,6 +230,47 @@ mod tests {
             POLL,
             "an outstanding reading must be consumed by the read, not published twice"
         );
+    }
+
+    #[test]
+    fn given_no_packet_received_when_the_bike_id_is_read_then_it_is_unknown() {
+        // The channel's initial value has bike_id 0, which is a real id, so a
+        // consumer reading the field directly would announce bike #000 before
+        // any bike had been heard.
+        assert_eq!(KeiserStats::default().bike_id(), None);
+    }
+
+    #[test]
+    fn given_a_received_packet_when_the_bike_id_is_read_then_it_is_known() {
+        let stats = KeiserStats {
+            bike_id: 0,
+            ..live_stats()
+        };
+        assert_eq!(stats.bike_id(), Some(0), "zero is a real id once received");
+    }
+
+    #[test]
+    fn given_a_stale_reading_when_the_bike_id_is_read_then_it_is_still_known() {
+        // Staleness zeroes the live metrics; it does not forget which bike.
+        let stats = KeiserStats {
+            bike_id: 42,
+            last_updated: Some(std::time::Instant::now() - STALE_AFTER * 2),
+            ..Default::default()
+        };
+        assert_eq!(stats.bike_id(), Some(42));
+    }
+
+    #[test]
+    fn given_a_bike_id_when_labelled_then_it_is_zero_padded_to_three_digits() {
+        assert_eq!(bike_id_label(0), "000");
+        assert_eq!(bike_id_label(7), "007");
+        assert_eq!(bike_id_label(42), "042");
+        assert_eq!(bike_id_label(200), "200");
+    }
+
+    #[test]
+    fn given_a_bike_id_when_named_then_the_name_carries_the_padded_id() {
+        assert_eq!(bike_display_name(42), "Keiser M3i #042");
     }
 
     #[test]

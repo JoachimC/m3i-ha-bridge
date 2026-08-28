@@ -1,5 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rumqttc::{AsyncClient, Event, EventLoop, LastWill, MqttOptions, Outgoing, Packet, QoS};
@@ -8,7 +10,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::stats::{KeiserStats, next_reading};
+use crate::stats::{KeiserStats, bike_display_name, bike_id_label, next_reading};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// Capacity of rumqttc's request channel — `AsyncClient::new`'s `cap` is
@@ -16,13 +18,21 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// and the event loop.
 ///
 /// It has to absorb a whole [`announce`] burst (availability plus one retained
-/// discovery config per entity) alongside the state publishes that queue up
-/// while the event loop is busy reconnecting. Beyond that `try_publish` rejects
-/// rather than blocks, and a dropped retained discovery config stays missing
-/// until the next reconnect. The old value of 16 left barely any headroom over
-/// a single burst; zero would be a rendezvous channel, where `try_publish` only
-/// succeeds if the event loop happens to be parked at that exact instant.
-const REQUEST_CHANNEL_CAPACITY: usize = 64;
+/// discovery config per entity, per bike heard) alongside the state publishes
+/// that queue up while the event loop is busy reconnecting. Beyond that
+/// `try_publish` rejects rather than blocks, and a dropped retained discovery
+/// config stays missing until the next reconnect. Zero would be a rendezvous
+/// channel, where `try_publish` only succeeds if the event loop happens to be
+/// parked at that exact instant.
+///
+/// Sized for two bursts at the worst case — every ordinal id 0–200 heard —
+/// because a flapping connection announces twice in quick succession. flume
+/// grows its queue on demand, so the bound costs nothing until it is used.
+const REQUEST_CHANNEL_CAPACITY: usize = 2 * (1 + MAX_BIKES * DISCOVERY_MESSAGES_PER_BIKE);
+/// Ordinal ids run 0–200 (see `doc/bluetooth-protocol.md`).
+const MAX_BIKES: usize = 201;
+/// [`SENSORS`] plus the `paused` binary sensor.
+const DISCOVERY_MESSAGES_PER_BIKE: usize = SENSORS.len() + 1;
 /// Hard bound on the shutdown handshake: queue the retained `offline` message,
 /// wait for the broker to acknowledge it, then DISCONNECT.
 ///
@@ -92,17 +102,173 @@ impl MqttConfig {
         })
     }
 
-    pub fn state_topic(&self) -> String {
-        format!("{}/state", self.topic_prefix)
+    /// Where one bike's readings go: `<prefix>/<id>/state`.
+    pub fn state_topic(&self, bike_id: u8) -> String {
+        format!("{}/{}/state", self.topic_prefix, bike_id_label(bike_id))
     }
 
-    pub fn availability_topic(&self) -> String {
+    /// Whether the *bridge* is running: the last will lives here, so a crash
+    /// takes every bike's entities offline at once.
+    pub fn bridge_availability_topic(&self) -> String {
         format!("{}/availability", self.topic_prefix)
     }
 
+    /// Whether one *bike* is being heard: `offline` once its readings go
+    /// stale, so a bike that has been switched off greys out in Home Assistant
+    /// while the bridge, and the other bikes, stay online.
+    pub fn bike_availability_topic(&self, bike_id: u8) -> String {
+        format!(
+            "{}/{}/availability",
+            self.topic_prefix,
+            bike_id_label(bike_id)
+        )
+    }
+
     /// Node id used in Home Assistant discovery topics; must not contain '/'.
-    fn node_id(&self) -> String {
-        self.topic_prefix.replace('/', "_")
+    ///
+    /// Deliberately independent of the topic prefix: the same physical bike
+    /// heard by two bridges on one broker is one device, not two.
+    fn node_id(bike_id: u8) -> String {
+        format!("m3i-ha-bridge-{}", bike_id_label(bike_id))
+    }
+}
+
+/// A message the state loop wants sent. Everything here goes out at QoS 0:
+/// [`is_offline_publish`] identifies the shutdown's `offline` message by
+/// counting QoS 1 packet ids the driver did not queue, and a QoS 1 publish from
+/// this loop would be mistaken for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutgoingMessage {
+    pub topic: String,
+    pub payload: String,
+    pub retain: bool,
+}
+
+/// What the publisher knows about one bike.
+struct BikeChannel {
+    stats: KeiserStats,
+    gate: PublishGate,
+    /// The availability last published for this bike, so it is only re-sent
+    /// when it changes.
+    published_online: Option<bool>,
+}
+
+/// Turns the single stream of readings into per-bike state, availability and
+/// discovery messages — one Home Assistant device per bike heard.
+///
+/// Pure with respect to the connection: it decides *what* to send, and `run`
+/// sends it. That is what makes the per-bike behaviour testable without a
+/// broker.
+pub struct BikePublisher {
+    config: MqttConfig,
+    bikes: BTreeMap<u8, BikeChannel>,
+    /// Shared with the connection driver, which re-announces discovery for
+    /// every known bike on each reconnect.
+    known_bikes: Arc<Mutex<BTreeSet<u8>>>,
+}
+
+impl BikePublisher {
+    fn new(config: MqttConfig, known_bikes: Arc<Mutex<BTreeSet<u8>>>) -> Self {
+        Self {
+            config,
+            bikes: BTreeMap::new(),
+            known_bikes,
+        }
+    }
+
+    /// Records a reading. A bike seen for the first time gets its discovery
+    /// configs, so its device exists before its first state arrives.
+    fn observe(&mut self, stats: KeiserStats) -> Vec<OutgoingMessage> {
+        let Some(bike_id) = stats.bike_id() else {
+            return Vec::new(); // the channel's initial value: nothing heard yet
+        };
+        match self.bikes.get_mut(&bike_id) {
+            Some(bike) => {
+                bike.stats = stats;
+                Vec::new()
+            }
+            None => {
+                tracing::info!("Bike {} heard for the first time; announcing it", bike_id);
+                self.bikes.insert(
+                    bike_id,
+                    BikeChannel {
+                        stats,
+                        gate: PublishGate::new(HEARTBEAT_INTERVAL),
+                        published_online: None,
+                    },
+                );
+                self.known_bikes.lock().unwrap().insert(bike_id);
+                discovery_messages(&self.config, bike_id)
+                    .into_iter()
+                    .map(|(topic, payload)| OutgoingMessage {
+                        topic,
+                        payload: payload.to_string(),
+                        retain: true,
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Publishes every bike's availability and state through `publish`, which
+    /// reports whether the message was actually queued. Only a queued state is
+    /// recorded, so a rejected one is retried on the next tick rather than
+    /// deduplicated away.
+    fn tick(&mut self, now: Instant, mut publish: impl FnMut(&OutgoingMessage) -> bool) {
+        for (&bike_id, bike) in &mut self.bikes {
+            let online = !bike.stats.is_stale();
+            if bike.published_online != Some(online) {
+                let message = OutgoingMessage {
+                    topic: self.config.bike_availability_topic(bike_id),
+                    payload: if online { "online" } else { "offline" }.to_string(),
+                    retain: true,
+                };
+                if publish(&message) {
+                    bike.published_online = Some(online);
+                }
+            }
+
+            let payload = state_payload(&bike.stats.clone().sanitized()).to_string();
+            if !bike.gate.should_publish(&payload, now) {
+                continue;
+            }
+            let message = OutgoingMessage {
+                topic: self.config.state_topic(bike_id),
+                payload,
+                retain: false,
+            };
+            if publish(&message) {
+                bike.gate.record_published(message.payload, now);
+            }
+        }
+    }
+
+    /// The retained `offline` for every bike, sent ahead of the bridge's own
+    /// so a Home Assistant that comes back later sees each device as gone.
+    fn offline_messages(&self) -> Vec<OutgoingMessage> {
+        self.bikes
+            .keys()
+            .map(|&bike_id| OutgoingMessage {
+                topic: self.config.bike_availability_topic(bike_id),
+                payload: "offline".to_string(),
+                retain: true,
+            })
+            .collect()
+    }
+}
+
+fn try_send(client: &AsyncClient, message: &OutgoingMessage) -> bool {
+    match client.try_publish(
+        &message.topic,
+        QoS::AtMostOnce,
+        message.retain,
+        message.payload.clone(),
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::debug!("MQTT publish to {} skipped: {}", message.topic, e);
+            false
+        }
     }
 }
 
@@ -245,13 +411,15 @@ pub async fn run(
         options.set_credentials(username, config.password.as_deref().unwrap_or(""));
     }
     options.set_last_will(LastWill::new(
-        config.availability_topic(),
+        config.bridge_availability_topic(),
         "offline",
         QoS::AtLeastOnce,
         true,
     ));
 
     let (client, eventloop) = AsyncClient::new(options, REQUEST_CHANNEL_CAPACITY);
+
+    let known_bikes = Arc::new(Mutex::new(BTreeSet::new()));
 
     // The connection driver is the sole poller of the event loop, which is also
     // what performs reconnects. Nothing else can drive the connection, so it
@@ -261,11 +429,11 @@ pub async fn run(
         eventloop,
         client.clone(),
         config.clone(),
+        known_bikes.clone(),
         cancel_token.clone(),
     ));
 
-    let state_topic = config.state_topic();
-    let mut gate = PublishGate::new(HEARTBEAT_INTERVAL);
+    let mut publisher = BikePublisher::new(config.clone(), known_bikes);
 
     let mut lost_producer = false;
     loop {
@@ -282,23 +450,16 @@ pub async fn run(
             break;
         };
 
-        if stats.last_updated.is_none() {
-            continue; // nothing received from the bike yet
+        for message in publisher.observe(stats) {
+            try_send(&client, &message);
         }
-
-        let payload = state_payload(&stats.sanitized()).to_string();
-        let now = Instant::now();
-        if !gate.should_publish(&payload, now) {
-            continue;
-        }
-
-        match client.try_publish(&state_topic, QoS::AtMostOnce, false, payload.clone()) {
-            Ok(()) => gate.record_published(payload, now),
-            Err(e) => tracing::debug!("MQTT state publish skipped: {}", e),
-        }
+        publisher.tick(Instant::now(), |message| try_send(&client, message));
     }
 
     tracing::info!("Shutting down MQTT publisher...");
+    for message in publisher.offline_messages() {
+        try_send(&client, &message);
+    }
     shutdown(&client, &config, driver).await;
 
     if lost_producer {
@@ -325,7 +486,7 @@ async fn shutdown(
     // the last state publish. Queuing it is also what wakes the event loop and
     // starts the handshake.
     if let Err(e) = client.try_publish(
-        config.availability_topic(),
+        config.bridge_availability_topic(),
         QoS::AtLeastOnce,
         true,
         "offline",
@@ -361,6 +522,7 @@ async fn drive_connection(
     mut eventloop: EventLoop,
     client: AsyncClient,
     config: MqttConfig,
+    known_bikes: Arc<Mutex<BTreeSet<u8>>>,
     cancel_token: CancellationToken,
 ) {
     let mut driver_queued = 0;
@@ -369,7 +531,8 @@ async fn drive_connection(
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::ConnAck(_))) if !cancel_token.is_cancelled() => {
                 tracing::info!("Connected to MQTT broker");
-                driver_queued = announce(&client, &config);
+                let bikes = known_bikes.lock().unwrap().clone();
+                driver_queued = announce(&client, &config, &bikes);
             }
             // A non-zero packet id means a QoS 1 publish reached the socket;
             // the QoS 0 state publishes always report packet id 0.
@@ -451,8 +614,13 @@ async fn finish_shutdown(eventloop: &mut EventLoop, client: &AsyncClient, offlin
     }
 }
 
-/// Publishes availability and the Home Assistant discovery configs, returning
-/// how many messages were queued.
+/// Publishes the bridge's availability and the Home Assistant discovery
+/// configs of every bike heard so far, returning how many messages were queued.
+///
+/// A bike's configs are first published by the state loop the moment it is
+/// heard; this repeats them on every reconnect, because anything queued for
+/// the old connection is gone and a retained config the broker never received
+/// stays missing.
 ///
 /// Runs inside the connection driver, which is the only task polling the event
 /// loop, so it must never await a publish. `client.publish(..).await` parks
@@ -465,11 +633,11 @@ async fn finish_shutdown(eventloop: &mut EventLoop, client: &AsyncClient, offlin
 /// For the same reason `announce` is not spawned: a spawned task could
 /// interleave its retained configs with a second reconnect's, and with adequate
 /// capacity there is nothing for spawning to buy.
-fn announce(client: &AsyncClient, config: &MqttConfig) -> usize {
+fn announce(client: &AsyncClient, config: &MqttConfig, bikes: &BTreeSet<u8>) -> usize {
     let mut queued = 0;
 
     match client.try_publish(
-        config.availability_topic(),
+        config.bridge_availability_topic(),
         QoS::AtLeastOnce,
         true,
         "online",
@@ -478,10 +646,12 @@ fn announce(client: &AsyncClient, config: &MqttConfig) -> usize {
         Err(e) => tracing::warn!("Failed to publish MQTT availability: {}", e),
     }
 
-    for (topic, payload) in discovery_messages(config) {
-        match client.try_publish(topic, QoS::AtLeastOnce, true, payload.to_string()) {
-            Ok(()) => queued += 1,
-            Err(e) => tracing::warn!("Failed to publish MQTT discovery config: {}", e),
+    for &bike_id in bikes {
+        for (topic, payload) in discovery_messages(config, bike_id) {
+            match client.try_publish(topic, QoS::AtLeastOnce, true, payload.to_string()) {
+                Ok(()) => queued += 1,
+                Err(e) => tracing::warn!("Failed to publish MQTT discovery config: {}", e),
+            }
         }
     }
 
@@ -543,6 +713,9 @@ struct SensorSpec {
     /// resolution when the payload is built.
     precision: Option<u8>,
     icon: Option<&'static str>,
+    /// `diagnostic` moves an entity out of the device's main sensor list into
+    /// its Diagnostic section — right for identity, wrong for a reading.
+    entity_category: Option<&'static str>,
 }
 
 /// Home Assistant metadata for each published sensor.
@@ -567,6 +740,7 @@ const SENSORS: &[SensorSpec] = &[
         state_class: Some("measurement"),
         precision: Some(0),
         icon: None, // the device class supplies one
+        entity_category: None,
     },
     SensorSpec {
         object_id: "cadence",
@@ -577,6 +751,7 @@ const SENSORS: &[SensorSpec] = &[
         state_class: Some("measurement"),
         precision: Some(0),
         icon: Some("mdi:rotate-right"),
+        entity_category: None,
     },
     SensorSpec {
         object_id: "heart_rate",
@@ -587,6 +762,7 @@ const SENSORS: &[SensorSpec] = &[
         state_class: Some("measurement"),
         precision: Some(0),
         icon: Some("mdi:heart-pulse"),
+        entity_category: None,
     },
     SensorSpec {
         object_id: "gear",
@@ -597,6 +773,7 @@ const SENSORS: &[SensorSpec] = &[
         state_class: Some("measurement"),
         precision: Some(0),
         icon: Some("mdi:cog"),
+        entity_category: None,
     },
     SensorSpec {
         object_id: "distance",
@@ -609,6 +786,7 @@ const SENSORS: &[SensorSpec] = &[
         // precision the reading does not have.
         precision: Some(1),
         icon: Some("mdi:map-marker-distance"),
+        entity_category: None,
     },
     SensorSpec {
         object_id: "energy",
@@ -624,6 +802,7 @@ const SENSORS: &[SensorSpec] = &[
         state_class: Some("total_increasing"),
         precision: Some(0),
         icon: Some("mdi:fire"),
+        entity_category: None,
     },
     SensorSpec {
         object_id: "elapsed_time",
@@ -634,6 +813,21 @@ const SENSORS: &[SensorSpec] = &[
         state_class: Some("measurement"),
         precision: Some(0),
         icon: None,
+        entity_category: None,
+    },
+    // Identity rather than a measurement: no unit, no state class (there is
+    // nothing to aggregate), and filed under Diagnostic so it does not sit
+    // between Power and Cadence on the dashboard.
+    SensorSpec {
+        object_id: "bike_id",
+        name: "Bike ID",
+        value_template: "{{ value_json.bike_id }}",
+        unit: None,
+        device_class: None,
+        state_class: None,
+        precision: None,
+        icon: Some("mdi:identifier"),
+        entity_category: Some("diagnostic"),
     },
 ];
 
@@ -643,9 +837,10 @@ const SENSORS: &[SensorSpec] = &[
 /// # Entity naming
 ///
 /// Each sensor announces a short `name` ("Power") plus the `device` block, and
-/// Home Assistant composes the two: friendly name "Keiser M3i Power", entity id
-/// `sensor.keiser_m3i_power`. There is no bare `sensor.power` to collide with
-/// anything else on the instance.
+/// Home Assistant composes the two: friendly name "Keiser M3i #042 Power",
+/// entity id `sensor.keiser_m3i_042_power`. There is no bare `sensor.power` to
+/// collide with anything else on the instance, and two bikes never collide with
+/// each other.
 ///
 /// Do **not** add `"has_entity_name": true` to these payloads. It is not an
 /// MQTT discovery option — the MQTT integration sets `_attr_has_entity_name`
@@ -661,14 +856,21 @@ const SENSORS: &[SensorSpec] = &[
 /// Home Assistant version for no user-visible gain, and migrating requires a
 /// documented three-phase handshake that a stateless reconnect-and-announce
 /// publisher cannot perform idempotently.
-fn discovery_messages(config: &MqttConfig) -> Vec<(String, serde_json::Value)> {
-    let node_id = config.node_id();
+fn discovery_messages(config: &MqttConfig, bike_id: u8) -> Vec<(String, serde_json::Value)> {
+    let node_id = MqttConfig::node_id(bike_id);
     let device = json!({
-        "identifiers": [format!("m3i_ha_bridge_{}", node_id)],
-        "name": "Keiser M3i",
+        "identifiers": [format!("m3i_ha_bridge_{}", bike_id_label(bike_id))],
+        "name": bike_display_name(bike_id),
         "manufacturer": "Keiser",
         "model": "M3i",
     });
+    // Both must say online: the bridge's topic carries the last will, so a
+    // crash takes every bike down; the bike's own topic goes offline when its
+    // readings go stale, so a bike that is switched off greys out on its own.
+    let availability = json!([
+        { "topic": config.bridge_availability_topic() },
+        { "topic": config.bike_availability_topic(bike_id) },
+    ]);
     // Only recommended for per-entity discovery, but mandatory if this ever
     // moves to device-based discovery, so it costs nothing to add now.
     let origin = json!({
@@ -681,9 +883,10 @@ fn discovery_messages(config: &MqttConfig) -> Vec<(String, serde_json::Value)> {
         let mut payload = json!({
             "name": spec.name,
             "unique_id": format!("{}_{}", node_id, spec.object_id),
-            "state_topic": config.state_topic(),
+            "state_topic": config.state_topic(bike_id),
             "value_template": spec.value_template,
-            "availability_topic": config.availability_topic(),
+            "availability": availability,
+            "availability_mode": "all",
             "expire_after": EXPIRE_AFTER_SECS,
             "device": device,
             "origin": origin,
@@ -704,6 +907,9 @@ fn discovery_messages(config: &MqttConfig) -> Vec<(String, serde_json::Value)> {
         if let Some(icon) = spec.icon {
             obj.insert("icon".into(), json!(icon));
         }
+        if let Some(entity_category) = spec.entity_category {
+            obj.insert("entity_category".into(), json!(entity_category));
+        }
         (
             format!(
                 "{}/sensor/{}/{}/config",
@@ -723,9 +929,10 @@ fn discovery_messages(config: &MqttConfig) -> Vec<(String, serde_json::Value)> {
         json!({
             "name": "Paused",
             "unique_id": format!("{}_paused", node_id),
-            "state_topic": config.state_topic(),
+            "state_topic": config.state_topic(bike_id),
             "value_template": "{{ 'ON' if value_json.is_paused else 'OFF' }}",
-            "availability_topic": config.availability_topic(),
+            "availability": availability,
+            "availability_mode": "all",
             // Same expiry as the sensors. Without it this entity stayed live
             // while every sensor went unavailable, so the device contradicted
             // itself about whether the bike was reachable.
@@ -807,8 +1014,15 @@ mod tests {
         assert_eq!(config.username.as_deref(), Some("ha"));
         assert_eq!(config.password.as_deref(), Some("secret"));
         assert_eq!(config.client_id, "bike-bridge");
-        assert_eq!(config.state_topic(), "fitness/m3i/state");
-        assert_eq!(config.availability_topic(), "fitness/m3i/availability");
+        assert_eq!(config.state_topic(42), "fitness/m3i/042/state");
+        assert_eq!(
+            config.bridge_availability_topic(),
+            "fitness/m3i/availability"
+        );
+        assert_eq!(
+            config.bike_availability_topic(42),
+            "fitness/m3i/042/availability"
+        );
     }
 
     #[test]
@@ -1020,37 +1234,287 @@ mod tests {
         assert_eq!(round_to_native_resolution(0.0).to_string(), "0");
     }
 
+    /// The bike every discovery test announces.
+    const BIKE: u8 = 42;
+
     #[test]
     fn given_config_when_discovery_messages_are_built_then_topics_and_links_are_correct() {
+        // Issue #6: one device per bike, so the node id, topics and unique ids
+        // all carry the padded bike id.
         let vars = HashMap::from([("MQTT_HOST", "broker.local")]);
         let config = config_from(&vars, &HashMap::new()).unwrap();
-        let messages = discovery_messages(&config);
+        let messages = discovery_messages(&config, BIKE);
 
         let (power_topic, power_payload) = messages
             .iter()
             .find(|(topic, _)| topic.ends_with("/power/config"))
             .unwrap();
-        assert_eq!(power_topic, "homeassistant/sensor/m3i/power/config");
-        assert_eq!(power_payload["state_topic"], "m3i/state");
-        assert_eq!(power_payload["availability_topic"], "m3i/availability");
-        assert_eq!(power_payload["unique_id"], "m3i_power");
-
-        assert!(
-            messages
-                .iter()
-                .any(|(topic, _)| topic == "homeassistant/binary_sensor/m3i/paused/config")
+        assert_eq!(
+            power_topic,
+            "homeassistant/sensor/m3i-ha-bridge-042/power/config"
         );
+        assert_eq!(power_payload["state_topic"], "m3i/042/state");
+        assert_eq!(power_payload["unique_id"], "m3i-ha-bridge-042_power");
+
+        assert!(messages.iter().any(|(topic, _)| {
+            topic == "homeassistant/binary_sensor/m3i-ha-bridge-042/paused/config"
+        }));
+    }
+
+    #[test]
+    fn given_a_discovery_message_when_announced_then_it_requires_both_bridge_and_bike_online() {
+        // The bridge topic carries the last will; the bike topic goes offline
+        // when that bike's readings go stale. An entity is only available when
+        // both say so, otherwise a dead bridge would leave a bike "online".
+        for object_id in ["power", "paused"] {
+            let payload = discovery_for(object_id);
+            assert_eq!(
+                payload["availability"],
+                json!([
+                    { "topic": "m3i/availability" },
+                    { "topic": "m3i/042/availability" },
+                ]),
+                "{object_id}"
+            );
+            assert_eq!(payload["availability_mode"], "all", "{object_id}");
+            assert!(
+                payload.get("availability_topic").is_none(),
+                "{object_id}: availability_topic and availability are mutually exclusive"
+            );
+        }
+    }
+
+    #[test]
+    fn given_the_bike_id_sensor_when_announced_then_it_is_a_diagnostic_integer() {
+        let payload = discovery_for("bike_id");
+        assert_eq!(payload["name"], "Bike ID");
+        assert_eq!(payload["entity_category"], "diagnostic");
+        assert!(payload.get("unit_of_measurement").is_none());
+        assert!(payload.get("state_class").is_none(), "nothing to aggregate");
+        assert_eq!(payload["value_template"], "{{ value_json.bike_id }}");
+
+        let stats = KeiserStats {
+            bike_id: BIKE,
+            last_updated: Some(std::time::Instant::now()),
+            ..Default::default()
+        };
+        assert_eq!(
+            state_payload(&stats)["bike_id"],
+            json!(42),
+            "the console shows 42, not \"042\""
+        );
+    }
+
+    #[test]
+    fn given_the_measurement_sensors_when_announced_then_none_is_diagnostic() {
+        for spec in SENSORS.iter().filter(|spec| spec.object_id != "bike_id") {
+            assert!(
+                discovery_for(spec.object_id)
+                    .get("entity_category")
+                    .is_none(),
+                "{} is a reading and belongs in the main sensor list",
+                spec.object_id
+            );
+        }
     }
 
     fn discovery_for(object_id: &str) -> serde_json::Value {
         let vars = HashMap::from([("MQTT_HOST", "broker.local")]);
         let config = config_from(&vars, &HashMap::new()).unwrap();
         let suffix = format!("/{object_id}/config");
-        discovery_messages(&config)
+        discovery_messages(&config, BIKE)
             .into_iter()
             .find(|(topic, _)| topic.ends_with(&suffix))
             .unwrap_or_else(|| panic!("no discovery message for {object_id}"))
             .1
+    }
+
+    fn reading_from(bike_id: u8, power: u16) -> KeiserStats {
+        KeiserStats {
+            bike_id,
+            power,
+            cadence: 80.0,
+            last_updated: Some(std::time::Instant::now()),
+            ..Default::default()
+        }
+    }
+
+    fn publisher() -> BikePublisher {
+        BikePublisher::new(test_config(), Arc::new(Mutex::new(BTreeSet::new())))
+    }
+
+    /// Runs one tick, accepting every message, and returns what was sent.
+    fn tick_all(publisher: &mut BikePublisher) -> Vec<OutgoingMessage> {
+        let mut sent = Vec::new();
+        publisher.tick(Instant::now(), |message| {
+            sent.push(message.clone());
+            true
+        });
+        sent
+    }
+
+    #[test]
+    fn given_the_initial_reading_when_observed_then_nothing_is_announced() {
+        // The channel starts with a default reading whose bike_id is 0 — a
+        // real id. Announcing it would create a phantom bike #000 device.
+        let mut publisher = publisher();
+        assert!(publisher.observe(KeiserStats::default()).is_empty());
+        assert!(tick_all(&mut publisher).is_empty());
+    }
+
+    #[test]
+    fn given_a_bike_heard_for_the_first_time_when_observed_then_its_discovery_is_sent() {
+        let mut publisher = publisher();
+        let messages = publisher.observe(reading_from(BIKE, 150));
+
+        assert_eq!(
+            messages.len(),
+            discovery_messages(&test_config(), BIKE).len()
+        );
+        assert!(messages.iter().all(|m| m.retain));
+        assert!(
+            messages
+                .iter()
+                .all(|m| m.topic.contains("/m3i-ha-bridge-042/")),
+            "every config belongs to this bike's node"
+        );
+        assert_eq!(
+            *publisher.known_bikes.lock().unwrap(),
+            BTreeSet::from([BIKE]),
+            "the driver re-announces from this set on reconnect"
+        );
+
+        assert!(
+            publisher.observe(reading_from(BIKE, 160)).is_empty(),
+            "discovery is sent once per bike, not per reading"
+        );
+    }
+
+    #[test]
+    fn given_a_live_bike_when_ticked_then_it_is_online_and_its_state_is_on_its_own_topic() {
+        let mut publisher = publisher();
+        publisher.observe(reading_from(BIKE, 150));
+
+        let sent = tick_all(&mut publisher);
+
+        assert_eq!(
+            sent[0],
+            OutgoingMessage {
+                topic: "m3i/042/availability".into(),
+                payload: "online".into(),
+                retain: true,
+            },
+            "availability precedes state, so HA never sees state for an offline bike"
+        );
+        assert_eq!(sent[1].topic, "m3i/042/state");
+        assert!(!sent[1].retain);
+        let state: serde_json::Value = serde_json::from_str(&sent[1].payload).unwrap();
+        assert_eq!(state["bike_id"], 42);
+        assert_eq!(state["power"], 150);
+    }
+
+    #[test]
+    fn given_two_bikes_when_ticked_then_each_has_its_own_device_and_topics() {
+        // The multi-bike room: readings alternate, and each bike keeps its own
+        // last reading rather than the two overwriting each other.
+        let mut publisher = publisher();
+        publisher.observe(reading_from(1, 100));
+        publisher.observe(reading_from(2, 200));
+        publisher.observe(reading_from(1, 110));
+
+        let sent = tick_all(&mut publisher);
+        let state_of = |topic: &str| -> serde_json::Value {
+            let m = sent.iter().find(|m| m.topic == topic).unwrap();
+            serde_json::from_str(&m.payload).unwrap()
+        };
+        assert_eq!(state_of("m3i/001/state")["power"], 110);
+        assert_eq!(state_of("m3i/002/state")["power"], 200);
+        assert_eq!(
+            *publisher.known_bikes.lock().unwrap(),
+            BTreeSet::from([1, 2])
+        );
+    }
+
+    #[test]
+    fn given_an_unchanged_reading_when_ticked_again_then_nothing_is_resent() {
+        let mut publisher = publisher();
+        publisher.observe(reading_from(BIKE, 150));
+        tick_all(&mut publisher);
+
+        assert!(
+            tick_all(&mut publisher).is_empty(),
+            "availability and state are both unchanged"
+        );
+    }
+
+    #[test]
+    fn given_a_bike_that_went_stale_when_ticked_then_it_goes_offline_and_its_metrics_zero() {
+        let mut publisher = publisher();
+        publisher.observe(reading_from(BIKE, 150));
+        tick_all(&mut publisher);
+
+        publisher.bikes.get_mut(&BIKE).unwrap().stats.last_updated =
+            Some(std::time::Instant::now() - crate::stats::STALE_AFTER * 2);
+        let sent = tick_all(&mut publisher);
+
+        assert_eq!(sent[0].topic, "m3i/042/availability");
+        assert_eq!(sent[0].payload, "offline");
+        let state: serde_json::Value = serde_json::from_str(&sent[1].payload).unwrap();
+        assert_eq!(state["power"], 0);
+        assert_eq!(state["bike_id"], 42, "identity survives staleness");
+    }
+
+    #[test]
+    fn given_a_stale_bike_when_it_is_heard_again_then_it_comes_back_online() {
+        let mut publisher = publisher();
+        publisher.observe(reading_from(BIKE, 150));
+        tick_all(&mut publisher);
+        publisher.bikes.get_mut(&BIKE).unwrap().stats.last_updated =
+            Some(std::time::Instant::now() - crate::stats::STALE_AFTER * 2);
+        tick_all(&mut publisher);
+
+        publisher.observe(reading_from(BIKE, 90));
+        let sent = tick_all(&mut publisher);
+
+        assert_eq!(sent[0].payload, "online");
+        assert!(sent[0].retain);
+    }
+
+    #[test]
+    fn given_a_rejected_publish_when_ticked_again_then_it_is_retried() {
+        // try_publish can refuse when the request channel is full; the
+        // rejection must not be recorded as sent, or the reading is lost until
+        // the heartbeat.
+        let mut publisher = publisher();
+        publisher.observe(reading_from(BIKE, 150));
+        publisher.tick(Instant::now(), |_| false);
+
+        let sent = tick_all(&mut publisher);
+        assert_eq!(sent.len(), 2, "availability and state both retried");
+    }
+
+    #[test]
+    fn given_known_bikes_when_shutting_down_then_each_gets_a_retained_offline() {
+        let mut publisher = publisher();
+        publisher.observe(reading_from(1, 100));
+        publisher.observe(reading_from(2, 200));
+
+        let offline = publisher.offline_messages();
+        assert_eq!(
+            offline,
+            vec![
+                OutgoingMessage {
+                    topic: "m3i/001/availability".into(),
+                    payload: "offline".into(),
+                    retain: true,
+                },
+                OutgoingMessage {
+                    topic: "m3i/002/availability".into(),
+                    payload: "offline".into(),
+                    retain: true,
+                },
+            ]
+        );
     }
 
     /// Stands in for the event loop: `AsyncClient` is only a handle on
@@ -1082,9 +1546,9 @@ mod tests {
         let config = test_config();
         let (client, rx) = test_client(REQUEST_CHANNEL_CAPACITY);
 
-        let queued = announce(&client, &config);
+        let queued = announce(&client, &config, &BTreeSet::from([BIKE]));
 
-        let expected = 1 + discovery_messages(&config).len(); // availability + configs
+        let expected = 1 + discovery_messages(&config, BIKE).len(); // availability + configs
         assert_eq!(queued, expected, "announce should report what it queued");
         let publishes = queued_publishes(&rx);
         assert_eq!(publishes.len(), expected);
@@ -1103,16 +1567,25 @@ mod tests {
         let config = test_config();
         let (client, rx) = test_client(REQUEST_CHANNEL_CAPACITY);
 
-        let burst = 1 + discovery_messages(&config).len();
+        // The worst case: every ordinal id 0–200 has been heard. With per-bike
+        // devices (issue #6) the burst scales with the bikes in range, and the
+        // old capacity of 64 overflowed at four bikes.
+        let bikes: BTreeSet<u8> = (0..=200).collect();
+        let per_bike = discovery_messages(&config, BIKE).len();
+        assert_eq!(
+            per_bike, DISCOVERY_MESSAGES_PER_BIKE,
+            "the constant must track the real count"
+        );
+        let burst = 1 + bikes.len() * per_bike;
         assert!(
             burst <= REQUEST_CHANNEL_CAPACITY,
             "an announce burst of {burst} cannot fit a channel of {REQUEST_CHANNEL_CAPACITY}"
         );
 
         // Two bursts back to back, as a flapping connection produces, still fit
-        // alongside the state publishes queued in between.
-        assert_eq!(announce(&client, &config), burst);
-        assert_eq!(announce(&client, &config), burst);
+        // in the channel.
+        assert_eq!(announce(&client, &config, &bikes), burst);
+        assert_eq!(announce(&client, &config, &bikes), burst);
         assert_eq!(queued_publishes(&rx).len(), burst * 2);
     }
 
@@ -1124,7 +1597,11 @@ mod tests {
         let config = test_config();
         let (client, _rx) = test_client(3);
 
-        assert_eq!(announce(&client, &config), 3, "only what fits is queued");
+        assert_eq!(
+            announce(&client, &config, &BTreeSet::from([BIKE])),
+            3,
+            "only what fits is queued"
+        );
     }
 
     #[tokio::test]
@@ -1332,7 +1809,7 @@ mod tests {
         // The point of issue #10: without state_class Home Assistant records
         // history but computes no long-term statistics, so none of these
         // entities had any long-term data.
-        for spec in SENSORS {
+        for spec in SENSORS.iter().filter(|spec| spec.entity_category.is_none()) {
             let payload = discovery_for(spec.object_id);
             assert!(
                 payload["state_class"].is_string(),
@@ -1353,6 +1830,7 @@ mod tests {
             ("distance", Some("km"), Some("distance"), "total_increasing"),
             ("energy", Some("kcal"), Some("energy"), "total_increasing"),
             ("elapsed_time", Some("s"), Some("duration"), "measurement"),
+            ("bike_id", None, None, ""),
         ];
         assert_eq!(
             expected.len(),
@@ -1373,8 +1851,8 @@ mod tests {
                 "{object_id} device_class"
             );
             assert_eq!(
-                payload["state_class"].as_str(),
-                Some(state_class),
+                payload["state_class"].as_str().unwrap_or(""),
+                state_class,
                 "{object_id} state_class"
             );
         }
@@ -1454,6 +1932,8 @@ mod tests {
     fn given_the_sensors_when_announced_then_unique_ids_are_unchanged_and_distinct() {
         // unique_id is what ties a discovery config to an existing entity, so
         // changing one would silently orphan the old entity and its history.
+        // Issue #6 changed them all deliberately (one device per bike); this
+        // pins the new form so it does not drift again by accident.
         let ids: Vec<String> = SENSORS
             .iter()
             .map(|spec| {
@@ -1466,13 +1946,14 @@ mod tests {
         assert_eq!(
             ids,
             [
-                "m3i_power",
-                "m3i_cadence",
-                "m3i_heart_rate",
-                "m3i_gear",
-                "m3i_distance",
-                "m3i_energy",
-                "m3i_elapsed_time",
+                "m3i-ha-bridge-042_power",
+                "m3i-ha-bridge-042_cadence",
+                "m3i-ha-bridge-042_heart_rate",
+                "m3i-ha-bridge-042_gear",
+                "m3i-ha-bridge-042_distance",
+                "m3i-ha-bridge-042_energy",
+                "m3i-ha-bridge-042_elapsed_time",
+                "m3i-ha-bridge-042_bike_id",
             ]
         );
     }
@@ -1480,14 +1961,20 @@ mod tests {
     #[test]
     fn given_a_discovery_message_when_announced_then_it_carries_a_short_name_and_a_device() {
         // This pairing is what makes Home Assistant derive
-        // sensor.keiser_m3i_power rather than a collision-prone sensor.power:
-        // it prefixes the entity name with the device name. A long name like
-        // "Keiser M3i Power" here would produce
-        // sensor.keiser_m3i_keiser_m3i_power instead.
+        // sensor.keiser_m3i_042_power rather than a collision-prone
+        // sensor.power: it prefixes the entity name with the device name. A
+        // long name like "Keiser M3i Power" here would produce
+        // sensor.keiser_m3i_042_keiser_m3i_power instead.
         for spec in SENSORS {
             let payload = discovery_for(spec.object_id);
             assert_eq!(
-                payload["device"]["name"], "Keiser M3i",
+                payload["device"]["name"], "Keiser M3i #042",
+                "{}",
+                spec.object_id
+            );
+            assert_eq!(
+                payload["device"]["identifiers"],
+                json!(["m3i_ha_bridge_042"]),
                 "{}",
                 spec.object_id
             );
@@ -1564,13 +2051,12 @@ mod tests {
             ("MQTT_TOPIC_PREFIX", "fitness/m3i"),
         ]);
         let config = config_from(&vars, &HashMap::new()).unwrap();
-        for (topic, _) in discovery_messages(&config) {
+        for (topic, _) in discovery_messages(&config, BIKE) {
             // HA discovery topics must be exactly <prefix>/<component>/<node_id>/<object_id>/config
             assert_eq!(
                 topic.split('/').count(),
                 5,
-                "unexpected topic depth: {}",
-                topic
+                "unexpected topic depth: {topic}"
             );
         }
     }
