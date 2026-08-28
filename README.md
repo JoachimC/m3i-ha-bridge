@@ -134,7 +134,7 @@ By default the bridge accepts every Keiser M3i it hears. All M-Series bikes adve
 
 Every bike the bridge hears is identified by that ordinal id, zero-padded to three digits in names and topics (`#042`, `042`). The id appears on both outputs:
 
-* **BLE** — the advertised name is `Keiser M3i #042`, and the Device Information Service (`0x180A`) reports `042` as the Serial Number String. Nothing is advertised until the first bike is heard. With no filter and several bikes in range, the advertisement follows the bike heard most recently, but only switches after a different id has been the latest for 10 s, so two bikes alternating packets do not make the name flap.
+* **BLE** — the advertised name is `Keiser M3i #042`, and the Device Information Service (`0x180A`) reports `042` as the Serial Number String. Nothing is advertised until the first bike is heard. With no filter and several bikes in range, the advertisement follows the bike heard most recently, but only switches after a different id has been the latest for 10 s, so two bikes alternating packets do not make the name flap. A connected client receives only the advertised bike's readings; the others are never mixed in. One adapter is one peripheral, so a studio that wants Zwift pairing per bike needs one bridge per bike, each with `KEISER_BIKE_ID` set — the Home Assistant side works either way.
 * **MQTT** — one Home Assistant device per bike, named `Keiser M3i #042`, with its own topics (see [MQTT Configuration](#mqtt-configuration)) and a diagnostic `Bike ID` sensor carrying the plain integer (`42`). A room with several bikes gets a device per bike.
 
 ## MQTT Configuration

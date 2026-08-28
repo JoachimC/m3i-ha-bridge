@@ -78,6 +78,27 @@ impl AdvertisedIdTracker {
     }
 }
 
+/// Picks the reading a notify loop should send: the one from the bike the
+/// advertisement names, or nothing.
+///
+/// The watch channel carries every bike in range, so in a multi-bike room a
+/// client paired to "Keiser M3i #042" would otherwise be notified with #007's
+/// power interleaved. A reading from another bike neither goes out nor
+/// replaces `kept`; the advertised bike's last reading is re-sent instead, so
+/// it still decays to zero on staleness rather than freezing at its last live
+/// value while another bike holds the channel.
+pub fn reading_for_advertised_bike(
+    kept: Option<KeiserStats>,
+    incoming: KeiserStats,
+    advertised: Option<u8>,
+) -> Option<KeiserStats> {
+    let advertised = advertised?;
+    if incoming.bike_id() == Some(advertised) {
+        return Some(incoming);
+    }
+    kept.filter(|kept| kept.bike_id() == Some(advertised))
+}
+
 /// A legacy (non-extended) BLE advertising packet carries at most 31 bytes of
 /// AD structures. Overrunning it makes BlueZ refuse to register the
 /// advertisement outright, so the budget is worth checking rather than
@@ -301,6 +322,59 @@ mod tests {
         // Heart Rate is not advertised today, but knowing it would still fit is
         // what makes that a choice rather than a constraint.
         assert!(legacy_advertising_size(&local_name(200), 3) <= LEGACY_ADVERTISING_CAPACITY);
+    }
+
+    fn reading_from(bike_id: u8, power: u16) -> KeiserStats {
+        KeiserStats {
+            bike_id,
+            power,
+            ..stats()
+        }
+    }
+
+    #[test]
+    fn given_nothing_advertised_when_a_reading_arrives_then_nothing_is_sent() {
+        // No advertisement means no client can have paired to a named bike,
+        // so there is no bike whose data it would be correct to send.
+        assert!(reading_for_advertised_bike(None, reading_from(1, 100), None).is_none());
+    }
+
+    #[test]
+    fn given_the_advertised_bikes_reading_when_it_arrives_then_it_is_sent() {
+        let sent = reading_for_advertised_bike(None, reading_from(42, 150), Some(42)).unwrap();
+        assert_eq!(sent.power, 150);
+    }
+
+    #[test]
+    fn given_another_bikes_reading_when_it_arrives_then_the_advertised_bikes_last_is_resent() {
+        // The multi-bike room: a client paired to #042 must never see #007's
+        // power, and must keep seeing #042's last reading so the staleness
+        // clock (its own last_updated) can zero it in due course.
+        let kept = Some(reading_from(42, 150));
+        let sent = reading_for_advertised_bike(kept, reading_from(7, 999), Some(42)).unwrap();
+        assert_eq!(sent.bike_id, 42);
+        assert_eq!(sent.power, 150);
+    }
+
+    #[test]
+    fn given_another_bikes_reading_and_nothing_kept_when_it_arrives_then_nothing_is_sent() {
+        assert!(reading_for_advertised_bike(None, reading_from(7, 999), Some(42)).is_none());
+    }
+
+    #[test]
+    fn given_the_advertisement_switched_bikes_when_the_old_bikes_reading_is_kept_then_it_is_dropped()
+     {
+        // After the advertisement moves to #007, #042's remembered reading is
+        // the wrong bike too — a #007 client must not be fed #042's tail.
+        let kept = Some(reading_from(42, 150));
+        assert!(reading_for_advertised_bike(kept, reading_from(3, 50), Some(7)).is_none());
+    }
+
+    #[test]
+    fn given_the_initial_channel_value_when_it_arrives_then_it_is_not_mistaken_for_bike_zero() {
+        // The default reading has bike_id 0 but no timestamp; with #000
+        // advertised it still must not be sent as that bike's data.
+        assert!(reading_for_advertised_bike(None, KeiserStats::default(), Some(0)).is_none());
     }
 
     #[test]

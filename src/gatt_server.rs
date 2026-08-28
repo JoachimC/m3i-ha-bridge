@@ -9,7 +9,8 @@ mod linux_impl {
     use crate::gatt_codec::{
         AdvertisedIdTracker, FTMS_FEATURE_VALUE, LEGACY_ADVERTISING_CAPACITY, cps_has_value,
         ftms_has_value, hrs_has_value, initial_notification, legacy_advertising_size, local_name,
-        serial_number, serialize_cps, serialize_ftms, serialize_hrs, wrap_u16,
+        reading_for_advertised_bike, serial_number, serialize_cps, serialize_ftms, serialize_hrs,
+        wrap_u16,
     };
     use crate::stats::{KeiserStats, current_reading, next_reading};
     use bluer::{
@@ -92,11 +93,16 @@ mod linux_impl {
     /// re-serializes and notifies on every stats change or poll tick until the
     /// client disconnects or the stats sender is dropped.
     ///
+    /// Only the advertised bike's readings go out — the client paired to a
+    /// named bike, and the channel carries every bike in range. See
+    /// [`reading_for_advertised_bike`].
+    ///
     /// Every payload it sends, the first one included, is built from sanitized
     /// stats — see [`initial_notification`].
     fn spawn_notify_loop<F>(
         name: &'static str,
         mut rx: watch::Receiver<KeiserStats>,
+        advertised_id: watch::Receiver<Option<u8>>,
         mut notifier: CharacteristicNotifier,
         has_value: fn(&KeiserStats) -> bool,
         mut serialize: F,
@@ -107,12 +113,19 @@ mod linux_impl {
             tracing::info!("GATT: Client subscribed to {}", name);
 
             let initial = current_reading(&mut rx);
-            if let Some(payload) = initial_notification(&initial, has_value, &mut serialize) {
+            let mut kept = reading_for_advertised_bike(None, initial, *advertised_id.borrow());
+            if let Some(initial) = &kept
+                && let Some(payload) = initial_notification(initial, has_value, &mut serialize)
+            {
                 let _ = notifier.notify(payload).await;
             }
 
             while let Some(stats) = next_reading(&mut rx, NOTIFY_POLL_INTERVAL).await {
-                let stats = stats.sanitized();
+                kept = reading_for_advertised_bike(kept, stats, *advertised_id.borrow());
+                let Some(stats) = &kept else {
+                    continue; // nothing from the advertised bike yet
+                };
+                let stats = stats.clone().sanitized();
                 if let Err(e) = notifier.notify(serialize(&stats)).await {
                     tracing::debug!("{} notification failed: {}, removing subscriber", name, e);
                     break;
@@ -163,6 +176,7 @@ mod linux_impl {
         uuid: bluer::Uuid,
         name: &'static str,
         stats_rx: watch::Receiver<KeiserStats>,
+        advertised_id: watch::Receiver<Option<u8>>,
         has_value: fn(&KeiserStats) -> bool,
         make_serializer: F,
     ) -> Characteristic
@@ -175,9 +189,10 @@ mod linux_impl {
                 notify: true,
                 method: CharacteristicNotifyMethod::Fun(Box::new(move |notifier| {
                     let rx = stats_rx.clone();
+                    let advertised_id = advertised_id.clone();
                     let serialize = make_serializer();
                     async move {
-                        spawn_notify_loop(name, rx, notifier, has_value, serialize);
+                        spawn_notify_loop(name, rx, advertised_id, notifier, has_value, serialize);
                     }
                     .boxed()
                 })),
@@ -221,6 +236,7 @@ mod linux_impl {
                             INDOOR_BIKE_DATA_CHAR_UUID,
                             "FTMS (Indoor Bike Data)",
                             stats_rx.clone(),
+                            advertised_id.clone(),
                             ftms_has_value,
                             || Box::new(serialize_ftms),
                         ),
@@ -238,6 +254,7 @@ mod linux_impl {
                             CPS_MEASUREMENT_CHAR_UUID,
                             "CPS (Cycling Power)",
                             stats_rx.clone(),
+                            advertised_id.clone(),
                             cps_has_value,
                             || Box::new(cps_serializer()),
                         ),
@@ -255,6 +272,7 @@ mod linux_impl {
                             HRS_MEASUREMENT_CHAR_UUID,
                             "HRS (Heart Rate)",
                             stats_rx.clone(),
+                            advertised_id.clone(),
                             hrs_has_value,
                             || Box::new(serialize_hrs),
                         ),
