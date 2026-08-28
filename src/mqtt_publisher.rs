@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rumqttc::{AsyncClient, Event, EventLoop, LastWill, MqttOptions, Outgoing, Packet, QoS};
@@ -11,7 +11,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::stats::{KeiserStats, bike_display_name, bike_id_label, next_reading};
+use crate::stats::{Fleet, KeiserStats, bike_display_name, bike_id_label, next_snapshot};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// Capacity of rumqttc's request channel — `AsyncClient::new`'s `cap` is
@@ -213,15 +213,14 @@ impl Qos1Ledger {
 
 /// What the publisher knows about one bike.
 struct BikeChannel {
-    stats: KeiserStats,
     gate: PublishGate,
     /// The availability last published for this bike, so it is only re-sent
     /// when it changes.
     published_online: Option<bool>,
 }
 
-/// Turns the single stream of readings into per-bike state, availability and
-/// discovery messages — one Home Assistant device per bike heard.
+/// Turns fleet snapshots into per-bike state, availability and discovery
+/// messages — one Home Assistant device per bike heard.
 ///
 /// Pure with respect to the connection: it decides *what* to send, and `run`
 /// sends it. That is what makes the per-bike behaviour testable without a
@@ -229,55 +228,56 @@ struct BikeChannel {
 pub struct BikePublisher {
     config: MqttConfig,
     bikes: BTreeMap<u8, BikeChannel>,
-    /// Shared with the connection driver, which re-announces discovery for
-    /// every known bike on each reconnect.
-    known_bikes: Arc<Mutex<BTreeSet<u8>>>,
 }
 
 impl BikePublisher {
-    fn new(config: MqttConfig, known_bikes: Arc<Mutex<BTreeSet<u8>>>) -> Self {
+    fn new(config: MqttConfig) -> Self {
         Self {
             config,
             bikes: BTreeMap::new(),
-            known_bikes,
         }
     }
 
-    /// Records a reading. A bike seen for the first time gets its discovery
-    /// configs, so its device exists before its first state arrives.
-    fn observe(&mut self, stats: KeiserStats) -> Vec<OutgoingMessage> {
-        let Some(bike_id) = stats.bike_id() else {
-            return Vec::new(); // the channel's initial value: nothing heard yet
-        };
-        match self.bikes.get_mut(&bike_id) {
-            Some(bike) => {
-                bike.stats = stats;
-                Vec::new()
-            }
-            None => {
+    /// Announces any bike in `fleet` seen for the first time, so its device
+    /// exists before its first state arrives.
+    fn observe(&mut self, fleet: &Fleet) -> Vec<OutgoingMessage> {
+        let new_bikes: Vec<u8> = fleet
+            .keys()
+            .filter(|bike_id| !self.bikes.contains_key(bike_id))
+            .copied()
+            .collect();
+        new_bikes
+            .into_iter()
+            .map(|bike_id| {
                 tracing::info!("Bike {} heard for the first time; announcing it", bike_id);
                 self.bikes.insert(
                     bike_id,
                     BikeChannel {
-                        stats,
                         gate: PublishGate::new(HEARTBEAT_INTERVAL),
                         published_online: None,
                     },
                 );
-                self.known_bikes.lock().unwrap().insert(bike_id);
                 let (topic, payload) = discovery_message(&self.config, bike_id);
-                vec![OutgoingMessage::retained(topic, payload.to_string())]
-            }
-        }
+                OutgoingMessage::retained(topic, payload.to_string())
+            })
+            .collect()
     }
 
     /// Publishes every bike's availability and state through `publish`, which
     /// reports whether the message was actually queued. Only a queued state is
     /// recorded, so a rejected one is retried on the next tick rather than
     /// deduplicated away.
-    fn tick(&mut self, now: Instant, mut publish: impl FnMut(&OutgoingMessage) -> bool) {
+    fn tick(
+        &mut self,
+        fleet: &Fleet,
+        now: Instant,
+        mut publish: impl FnMut(&OutgoingMessage) -> bool,
+    ) {
         for (&bike_id, bike) in &mut self.bikes {
-            let online = !bike.stats.is_stale();
+            let Some(reading) = fleet.get(&bike_id) else {
+                continue; // bikes are never removed from the fleet
+            };
+            let online = !reading.is_stale();
             if bike.published_online != Some(online) {
                 let message = OutgoingMessage::retained(
                     self.config.bike_availability_topic(bike_id),
@@ -288,7 +288,7 @@ impl BikePublisher {
                 }
             }
 
-            let payload = state_payload(&bike.stats.clone().sanitized()).to_string();
+            let payload = state_payload(&reading.sanitized()).to_string();
             if !bike.gate.should_publish(&payload, now) {
                 continue;
             }
@@ -473,7 +473,7 @@ impl PublishGate {
 /// reported as an error so the exit status says so.
 pub async fn run(
     cancel_token: CancellationToken,
-    mut stats_rx: watch::Receiver<KeiserStats>,
+    mut stats_rx: watch::Receiver<Arc<Fleet>>,
     config: MqttConfig,
 ) -> Result<(), crate::BoxError> {
     tracing::info!(
@@ -497,7 +497,6 @@ pub async fn run(
 
     let (client, eventloop) = AsyncClient::new(options, REQUEST_CHANNEL_CAPACITY);
 
-    let known_bikes = Arc::new(Mutex::new(BTreeSet::new()));
     let ledger = Qos1Ledger::default();
     // Bumped by the driver on every ConnAck, so the state loop can re-send
     // what the broker may have lost.
@@ -511,21 +510,21 @@ pub async fn run(
         eventloop,
         client.clone(),
         config.clone(),
-        known_bikes.clone(),
+        stats_rx.clone(),
         ledger.clone(),
         connected_tx,
         cancel_token.clone(),
     ));
 
-    let mut publisher = BikePublisher::new(config.clone(), known_bikes);
+    let mut publisher = BikePublisher::new(config.clone());
 
     let mut lost_producer = false;
     loop {
-        let reading = tokio::select! {
+        let snapshot = tokio::select! {
             _ = cancel_token.cancelled() => break,
-            reading = next_reading(&mut stats_rx, STATE_POLL_INTERVAL) => reading,
+            snapshot = next_snapshot(&mut stats_rx, STATE_POLL_INTERVAL) => snapshot,
         };
-        let Some(stats) = reading else {
+        let Some(fleet) = snapshot else {
             // The Bluetooth reader is the only producer, so losing it means
             // there will never be another reading. Still shut down tidily —
             // the retained "offline" message matters more than the exit code —
@@ -538,10 +537,10 @@ pub async fn run(
             connected_rx.borrow_and_update();
             publisher.reconnected();
         }
-        for message in publisher.observe(stats) {
+        for message in publisher.observe(&fleet) {
             try_send(&client, &ledger, &message);
         }
-        publisher.tick(Instant::now(), |message| {
+        publisher.tick(&fleet, Instant::now(), |message| {
             try_send(&client, &ledger, message)
         });
     }
@@ -612,7 +611,7 @@ async fn drive_connection(
     mut eventloop: EventLoop,
     client: AsyncClient,
     config: MqttConfig,
-    known_bikes: Arc<Mutex<BTreeSet<u8>>>,
+    fleet_rx: watch::Receiver<Arc<Fleet>>,
     ledger: Qos1Ledger,
     connected: watch::Sender<u64>,
     cancel_token: CancellationToken,
@@ -621,7 +620,7 @@ async fn drive_connection(
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::ConnAck(_))) if !cancel_token.is_cancelled() => {
                 tracing::info!("Connected to MQTT broker");
-                let bikes = known_bikes.lock().unwrap().clone();
+                let bikes: BTreeSet<u8> = fleet_rx.borrow().keys().copied().collect();
                 announce(&client, &ledger, &config, &bikes);
                 connected.send_modify(|generation| *generation += 1);
             }
@@ -1020,6 +1019,7 @@ fn discovery_message(config: &MqttConfig, bike_id: u8) -> (String, serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stats::Reading;
     use hex_literal::hex;
     use std::collections::HashMap;
 
@@ -1233,7 +1233,6 @@ mod tests {
             minutes: 2,
             seconds: 5,
             is_paused: false,
-            last_updated: Some(std::time::Instant::now()),
             ..Default::default()
         };
         let payload = state_payload(&stats);
@@ -1274,7 +1273,6 @@ mod tests {
     fn given_a_heart_rate_when_the_state_payload_is_built_then_it_is_rounded_too() {
         let stats = KeiserStats {
             heart_rate: 1205.0 / 10.0,
-            last_updated: Some(std::time::Instant::now()),
             ..Default::default()
         };
         assert!(
@@ -1390,7 +1388,6 @@ mod tests {
 
         let stats = KeiserStats {
             bike_id: BIKE,
-            last_updated: Some(std::time::Instant::now()),
             ..Default::default()
         };
         assert_eq!(
@@ -1428,24 +1425,39 @@ mod tests {
             .unwrap_or_else(|| panic!("no discovery component for {object_id}"))
     }
 
-    fn reading_from(bike_id: u8, power: u16) -> KeiserStats {
-        KeiserStats {
+    fn reading_from(bike_id: u8, power: u16) -> Reading {
+        Reading::now(KeiserStats {
             bike_id,
             power,
             cadence: 80.0,
-            last_updated: Some(std::time::Instant::now()),
             ..Default::default()
+        })
+    }
+
+    fn stale_reading_from(bike_id: u8, power: u16) -> Reading {
+        Reading {
+            received_at: std::time::Instant::now() - crate::stats::STALE_AFTER * 2,
+            ..reading_from(bike_id, power)
         }
     }
 
-    fn publisher() -> BikePublisher {
-        BikePublisher::new(test_config(), Arc::new(Mutex::new(BTreeSet::new())))
+    fn fleet_of(readings: impl IntoIterator<Item = Reading>) -> Fleet {
+        readings
+            .into_iter()
+            .map(|reading| (reading.stats.bike_id, reading))
+            .collect()
     }
 
-    /// Runs one tick, accepting every message, and returns what was sent.
-    fn tick_all(publisher: &mut BikePublisher) -> Vec<OutgoingMessage> {
+    fn publisher() -> BikePublisher {
+        BikePublisher::new(test_config())
+    }
+
+    /// Announces new bikes and runs one tick, accepting every message, and
+    /// returns what the tick sent.
+    fn tick_all(publisher: &mut BikePublisher, fleet: &Fleet) -> Vec<OutgoingMessage> {
+        publisher.observe(fleet);
         let mut sent = Vec::new();
-        publisher.tick(Instant::now(), |message| {
+        publisher.tick(fleet, Instant::now(), |message| {
             sent.push(message.clone());
             true
         });
@@ -1453,18 +1465,16 @@ mod tests {
     }
 
     #[test]
-    fn given_the_initial_reading_when_observed_then_nothing_is_announced() {
-        // The channel starts with a default reading whose bike_id is 0 — a
-        // real id. Announcing it would create a phantom bike #000 device.
+    fn given_an_empty_fleet_when_observed_then_nothing_is_announced() {
         let mut publisher = publisher();
-        assert!(publisher.observe(KeiserStats::default()).is_empty());
-        assert!(tick_all(&mut publisher).is_empty());
+        assert!(publisher.observe(&Fleet::new()).is_empty());
+        assert!(tick_all(&mut publisher, &Fleet::new()).is_empty());
     }
 
     #[test]
     fn given_a_bike_heard_for_the_first_time_when_observed_then_its_discovery_is_sent() {
         let mut publisher = publisher();
-        let messages = publisher.observe(reading_from(BIKE, 150));
+        let messages = publisher.observe(&fleet_of([reading_from(BIKE, 150)]));
 
         assert_eq!(messages.len(), 1, "one device-discovery message per bike");
         assert!(messages[0].retain);
@@ -1472,14 +1482,11 @@ mod tests {
             messages[0].topic, "homeassistant/device/m3i-ha-bridge-042/config",
             "the config belongs to this bike's node"
         );
-        assert_eq!(
-            *publisher.known_bikes.lock().unwrap(),
-            BTreeSet::from([BIKE]),
-            "the driver re-announces from this set on reconnect"
-        );
 
         assert!(
-            publisher.observe(reading_from(BIKE, 160)).is_empty(),
+            publisher
+                .observe(&fleet_of([reading_from(BIKE, 160)]))
+                .is_empty(),
             "discovery is sent once per bike, not per reading"
         );
     }
@@ -1487,9 +1494,8 @@ mod tests {
     #[test]
     fn given_a_live_bike_when_ticked_then_it_is_online_and_its_state_is_on_its_own_topic() {
         let mut publisher = publisher();
-        publisher.observe(reading_from(BIKE, 150));
 
-        let sent = tick_all(&mut publisher);
+        let sent = tick_all(&mut publisher, &fleet_of([reading_from(BIKE, 150)]));
 
         assert_eq!(
             sent[0],
@@ -1508,31 +1514,25 @@ mod tests {
         // The multi-bike room: readings alternate, and each bike keeps its own
         // last reading rather than the two overwriting each other.
         let mut publisher = publisher();
-        publisher.observe(reading_from(1, 100));
-        publisher.observe(reading_from(2, 200));
-        publisher.observe(reading_from(1, 110));
+        let fleet = fleet_of([reading_from(1, 110), reading_from(2, 200)]);
 
-        let sent = tick_all(&mut publisher);
+        let sent = tick_all(&mut publisher, &fleet);
         let state_of = |topic: &str| -> serde_json::Value {
             let m = sent.iter().find(|m| m.topic == topic).unwrap();
             serde_json::from_str(&m.payload).unwrap()
         };
         assert_eq!(state_of("m3i/001/state")["power"], 110);
         assert_eq!(state_of("m3i/002/state")["power"], 200);
-        assert_eq!(
-            *publisher.known_bikes.lock().unwrap(),
-            BTreeSet::from([1, 2])
-        );
     }
 
     #[test]
     fn given_an_unchanged_reading_when_ticked_again_then_nothing_is_resent() {
         let mut publisher = publisher();
-        publisher.observe(reading_from(BIKE, 150));
-        tick_all(&mut publisher);
+        let fleet = fleet_of([reading_from(BIKE, 150)]);
+        tick_all(&mut publisher, &fleet);
 
         assert!(
-            tick_all(&mut publisher).is_empty(),
+            tick_all(&mut publisher, &fleet).is_empty(),
             "availability and state are both unchanged"
         );
     }
@@ -1540,12 +1540,9 @@ mod tests {
     #[test]
     fn given_a_bike_that_went_stale_when_ticked_then_it_goes_offline_and_its_metrics_zero() {
         let mut publisher = publisher();
-        publisher.observe(reading_from(BIKE, 150));
-        tick_all(&mut publisher);
+        tick_all(&mut publisher, &fleet_of([reading_from(BIKE, 150)]));
 
-        publisher.bikes.get_mut(&BIKE).unwrap().stats.last_updated =
-            Some(std::time::Instant::now() - crate::stats::STALE_AFTER * 2);
-        let sent = tick_all(&mut publisher);
+        let sent = tick_all(&mut publisher, &fleet_of([stale_reading_from(BIKE, 150)]));
 
         assert_eq!(sent[0].topic, "m3i/042/availability");
         assert_eq!(sent[0].payload, "offline");
@@ -1557,14 +1554,10 @@ mod tests {
     #[test]
     fn given_a_stale_bike_when_it_is_heard_again_then_it_comes_back_online() {
         let mut publisher = publisher();
-        publisher.observe(reading_from(BIKE, 150));
-        tick_all(&mut publisher);
-        publisher.bikes.get_mut(&BIKE).unwrap().stats.last_updated =
-            Some(std::time::Instant::now() - crate::stats::STALE_AFTER * 2);
-        tick_all(&mut publisher);
+        tick_all(&mut publisher, &fleet_of([reading_from(BIKE, 150)]));
+        tick_all(&mut publisher, &fleet_of([stale_reading_from(BIKE, 150)]));
 
-        publisher.observe(reading_from(BIKE, 90));
-        let sent = tick_all(&mut publisher);
+        let sent = tick_all(&mut publisher, &fleet_of([reading_from(BIKE, 90)]));
 
         assert_eq!(sent[0].payload, "online");
         assert!(sent[0].retain);
@@ -1576,10 +1569,11 @@ mod tests {
         // rejection must not be recorded as sent, or the reading is lost until
         // the heartbeat.
         let mut publisher = publisher();
-        publisher.observe(reading_from(BIKE, 150));
-        publisher.tick(Instant::now(), |_| false);
+        let fleet = fleet_of([reading_from(BIKE, 150)]);
+        publisher.observe(&fleet);
+        publisher.tick(&fleet, Instant::now(), |_| false);
 
-        let sent = tick_all(&mut publisher);
+        let sent = tick_all(&mut publisher, &fleet);
         assert_eq!(sent.len(), 2, "availability and state both retried");
     }
 
@@ -1589,13 +1583,12 @@ mod tests {
         // away; a bike's `online` is only ever sent on a transition, so a
         // reconnect has to forget what was published.
         let mut publisher = publisher();
-        publisher.observe(reading_from(1, 100));
-        publisher.observe(reading_from(2, 200));
-        tick_all(&mut publisher);
-        assert!(tick_all(&mut publisher).is_empty(), "steady state");
+        let fleet = fleet_of([reading_from(1, 100), reading_from(2, 200)]);
+        tick_all(&mut publisher, &fleet);
+        assert!(tick_all(&mut publisher, &fleet).is_empty(), "steady state");
 
         publisher.reconnected();
-        let sent = tick_all(&mut publisher);
+        let sent = tick_all(&mut publisher, &fleet);
 
         let topics: Vec<&str> = sent.iter().map(|m| m.topic.as_str()).collect();
         assert_eq!(
@@ -1616,8 +1609,7 @@ mod tests {
     #[test]
     fn given_known_bikes_when_shutting_down_then_each_gets_a_retained_offline() {
         let mut publisher = publisher();
-        publisher.observe(reading_from(1, 100));
-        publisher.observe(reading_from(2, 200));
+        publisher.observe(&fleet_of([reading_from(1, 100), reading_from(2, 200)]));
 
         let offline = publisher.offline_messages();
         assert_eq!(
@@ -1845,11 +1837,12 @@ mod tests {
         let config = test_config();
 
         announce(&client, &ledger, &config, &BTreeSet::from([1]));
-        let mut publisher = BikePublisher::new(config, Arc::new(Mutex::new(BTreeSet::new())));
-        for message in publisher.observe(reading_from(2, 100)) {
+        let mut publisher = BikePublisher::new(config);
+        let fleet = fleet_of([reading_from(2, 100)]);
+        for message in publisher.observe(&fleet) {
             try_send(&client, &ledger, &message);
         }
-        publisher.tick(Instant::now(), |message| {
+        publisher.tick(&fleet, Instant::now(), |message| {
             try_send(&client, &ledger, message)
         });
         // bridge availability + 1 config from announce, 1 config + 1
@@ -1875,9 +1868,10 @@ mod tests {
         // Retained discovery and availability must survive a loss on the wire;
         // state is superseded within seconds and stays QoS 0.
         let mut publisher = publisher();
-        let discovery = publisher.observe(reading_from(BIKE, 150));
+        let fleet = fleet_of([reading_from(BIKE, 150)]);
+        let discovery = publisher.observe(&fleet);
         assert_eq!(discovery[0].qos, QoS::AtLeastOnce);
-        let sent = tick_all(&mut publisher);
+        let sent = tick_all(&mut publisher, &fleet);
         assert_eq!(sent[0].qos, QoS::AtLeastOnce, "availability");
         assert_eq!(sent[1].qos, QoS::AtMostOnce, "state");
         assert!(
@@ -2190,11 +2184,7 @@ mod tests {
         // The discovery configs and the state payload are edited in different
         // places, so this checks the JSON key each value_template reads is
         // actually published.
-        let stats = KeiserStats {
-            last_updated: Some(std::time::Instant::now()),
-            ..Default::default()
-        };
-        let payload = state_payload(&stats);
+        let payload = state_payload(&KeiserStats::default());
 
         for spec in SENSORS {
             let field = spec

@@ -124,7 +124,7 @@ Because the GATT server is `cfg(target_os = "linux")`, it never compiles on a Ma
 
 ## Bike Selection
 
-By default the bridge accepts every Keiser M3i it hears. All M-Series bikes advertise under the same company id and packet format, so in a room with more than one bike they all feed the same channel and the last advertisement received wins.
+By default the bridge accepts every Keiser M3i it hears. All M-Series bikes advertise under the same company id and packet format; each bike heard is tracked separately (see [Bike identity](#bike-identity)), and the filter below narrows the bridge to one of them.
 
 | Variable | Default | Description |
 |---|---|---|

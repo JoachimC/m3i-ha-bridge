@@ -15,7 +15,8 @@ use tokio_util::sync::CancellationToken;
 use crate::BoxError;
 use crate::keiser::{KEISER_MANUFACTURER_ID, parse_keiser_data};
 use crate::run_status::RunStatus;
-use crate::stats::KeiserStats;
+use crate::stats::{Fleet, KeiserStats, Reading, record_reading};
+use std::sync::Arc;
 
 /// One received advertisement, reduced to the only part this bridge reads.
 #[derive(Debug, Clone)]
@@ -56,7 +57,7 @@ pub trait BleScanner {
 pub async fn run_bridge<S: BleScanner>(
     scanner: &S,
     cancel_token: CancellationToken,
-    stats_tx: watch::Sender<KeiserStats>,
+    fleet_tx: watch::Sender<Arc<Fleet>>,
     bike_id_filter: Option<u8>,
 ) -> Result<RunStatus, BoxError> {
     let mut scan = scanner.scan(cancel_token.clone()).await?;
@@ -73,7 +74,7 @@ pub async fn run_bridge<S: BleScanner>(
                         &advertisement
                     );
                 }
-                handle_advertisement(&advertisement, &stats_tx, bike_id_filter);
+                handle_advertisement(&advertisement, &fleet_tx, bike_id_filter);
             }
             ScanEvent::Error(e) => {
                 tracing::error!("Bridge error: {}", e);
@@ -93,14 +94,18 @@ pub async fn run_bridge<S: BleScanner>(
     }
 }
 
+/// Stamps the arrival time here, at the boundary with the radio: the parser
+/// knows nothing about time, and nothing downstream can tell a live
+/// advertisement from bytes replayed out of a cache, so this must only ever
+/// be fed freshly received data.
 fn handle_advertisement(
     advertisement: &Advertisement,
-    stats_tx: &watch::Sender<KeiserStats>,
+    fleet_tx: &watch::Sender<Arc<Fleet>>,
     bike_id_filter: Option<u8>,
 ) {
     if let Some(stats) = keiser_stats_from(&advertisement.manufacturer_data, bike_id_filter) {
         log_bike_update(&advertisement.device, &stats);
-        let _ = stats_tx.send(stats);
+        record_reading(fleet_tx, Reading::now(stats));
     }
 }
 
@@ -204,14 +209,16 @@ mod tests {
             KEISER_MANUFACTURER_ID,
             &LIVE_CAPTURE,
         ))]);
-        let (stats_tx, stats_rx) = watch::channel(KeiserStats::default());
+        let (stats_tx, stats_rx) = crate::stats::fleet_channel();
 
         let status = run_bridge(&scanner, CancellationToken::new(), stats_tx, None)
             .await
             .expect("a clean stream end is not an error");
 
         assert_eq!(status, RunStatus::StreamEnded);
-        assert_eq!(stats_rx.borrow().cadence, 82.0);
+        let fleet = stats_rx.borrow();
+        assert_eq!(fleet[&0].stats.cadence, 82.0);
+        assert!(!fleet[&0].is_stale(), "stamped on arrival");
     }
 
     #[tokio::test]
@@ -220,15 +227,14 @@ mod tests {
             0x004C,
             &LIVE_CAPTURE,
         ))]);
-        let (stats_tx, stats_rx) = watch::channel(KeiserStats::default());
+        let (stats_tx, stats_rx) = crate::stats::fleet_channel();
 
         run_bridge(&scanner, CancellationToken::new(), stats_tx, None)
             .await
             .unwrap();
 
-        assert_eq!(
-            stats_rx.borrow().cadence,
-            0.0,
+        assert!(
+            stats_rx.borrow().is_empty(),
             "the channel must be untouched"
         );
     }
@@ -236,7 +242,7 @@ mod tests {
     #[tokio::test]
     async fn given_a_scan_error_when_the_bridge_runs_then_it_fails_so_the_loop_retries() {
         let scanner = FakeScanner::new(vec![ScanEvent::Error("adapter went away".into())]);
-        let (stats_tx, _stats_rx) = watch::channel(KeiserStats::default());
+        let (stats_tx, _stats_rx) = crate::stats::fleet_channel();
 
         let error = run_bridge(&scanner, CancellationToken::new(), stats_tx, None)
             .await
@@ -250,7 +256,7 @@ mod tests {
         // How every scanner signals cancellation now: end the stream. Reporting
         // StreamEnded here instead would make bridge_loop retry during shutdown.
         let scanner = FakeScanner::new(Vec::new());
-        let (stats_tx, _stats_rx) = watch::channel(KeiserStats::default());
+        let (stats_tx, _stats_rx) = crate::stats::fleet_channel();
         let cancel_token = CancellationToken::new();
         cancel_token.cancel();
 
@@ -264,7 +270,7 @@ mod tests {
     #[tokio::test]
     async fn given_an_uncancelled_token_when_the_scan_ends_then_the_run_reports_a_stream_end() {
         let scanner = FakeScanner::new(Vec::new());
-        let (stats_tx, _stats_rx) = watch::channel(KeiserStats::default());
+        let (stats_tx, _stats_rx) = crate::stats::fleet_channel();
 
         let status = run_bridge(&scanner, CancellationToken::new(), stats_tx, None)
             .await
@@ -279,13 +285,13 @@ mod tests {
             KEISER_MANUFACTURER_ID,
             &capture_for_bike(9),
         ))]);
-        let (stats_tx, stats_rx) = watch::channel(KeiserStats::default());
+        let (stats_tx, stats_rx) = crate::stats::fleet_channel();
 
         run_bridge(&scanner, CancellationToken::new(), stats_tx, Some(7))
             .await
             .unwrap();
 
-        assert_eq!(stats_rx.borrow().cadence, 0.0);
+        assert!(stats_rx.borrow().is_empty());
     }
 
     fn capture_for_bike(bike_id: u8) -> [u8; 17] {
@@ -311,7 +317,7 @@ mod tests {
         // the property the removed `Arc` used to provide. Moving the sender
         // into `run_bridge` instead of cloning would leave every restart
         // publishing into a closed channel, with both consumers already gone.
-        let (stats_tx, mut stats_rx) = watch::channel(KeiserStats::default());
+        let (stats_tx, mut stats_rx) = crate::stats::fleet_channel();
 
         let attempt = stats_tx.clone();
         drop(attempt);
@@ -320,32 +326,31 @@ mod tests {
             power: 42,
             ..Default::default()
         };
+        record_reading(&stats_tx, Reading::now(stats));
         assert!(
-            stats_tx.send(stats).is_ok(),
+            stats_rx.changed().await.is_ok(),
             "the channel must outlive one attempt"
         );
-        assert!(stats_rx.changed().await.is_ok());
-        assert_eq!(stats_rx.borrow().power, 42);
+        assert_eq!(stats_rx.borrow()[&0].stats.power, 42);
     }
 
-    #[test]
-    fn given_a_replayed_payload_when_filtered_then_it_is_stamped_as_freshly_received() {
-        // The constraint that forced issue #5's deletion, pinned so it is not
-        // rediscovered the hard way: nothing downstream can tell a live
-        // advertisement from bytes the Bluetooth stack replayed out of its
-        // cache — every parse is stamped `Instant::now()` and so looks live.
-        // Any future code path that reads cached manufacturer data (BlueZ
-        // `properties()`, bluer's `device.manufacturer_data()`) therefore
-        // silently resets the staleness clock, and must not feed this
-        // function.
-        let stats = keiser_stats_from(
-            &manufacturer_data(KEISER_MANUFACTURER_ID, &LIVE_CAPTURE),
+    #[tokio::test]
+    async fn given_a_replayed_payload_when_handled_then_it_is_stamped_as_freshly_received() {
+        // Nothing downstream can tell a live advertisement from bytes the
+        // Bluetooth stack replayed out of its cache: whatever reaches
+        // handle_advertisement is stamped as received now. Any code path that
+        // reads cached manufacturer data (BlueZ `properties()`, bluer's
+        // `device.manufacturer_data()`) would silently reset the staleness
+        // clock, and must not feed it.
+        let (stats_tx, stats_rx) = crate::stats::fleet_channel();
+        handle_advertisement(
+            &advertisement(KEISER_MANUFACTURER_ID, &LIVE_CAPTURE),
+            &stats_tx,
             None,
-        )
-        .expect("a valid Keiser packet should parse");
+        );
         assert!(
-            !stats.is_stale(),
-            "a parsed packet always looks fresh, however old the bytes are"
+            !stats_rx.borrow()[&0].is_stale(),
+            "a handled packet always looks fresh, however old the bytes are"
         );
     }
 

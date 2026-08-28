@@ -7,7 +7,8 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::BoxError;
-use crate::stats::KeiserStats;
+use crate::stats::Fleet;
+use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 pub type PlatformScanner = crate::scan_bluer::BluerScanner;
@@ -57,7 +58,7 @@ impl BlePlatform {
     pub async fn serve_gatt(
         &self,
         cancel_token: CancellationToken,
-        stats_rx: watch::Receiver<KeiserStats>,
+        stats_rx: watch::Receiver<Arc<Fleet>>,
     ) -> Result<(), BoxError> {
         crate::gatt_server::run(self.session.clone(), cancel_token, stats_rx).await
     }
@@ -66,7 +67,7 @@ impl BlePlatform {
     pub async fn serve_gatt(
         &self,
         cancel_token: CancellationToken,
-        stats_rx: watch::Receiver<KeiserStats>,
+        stats_rx: watch::Receiver<Arc<Fleet>>,
     ) -> Result<(), BoxError> {
         tracing::warn!(
             "BLE GATT server broadcasting is only supported on Linux (BlueZ). \

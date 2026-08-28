@@ -9,10 +9,10 @@ mod linux_impl {
     use crate::gatt_codec::{
         AdvertisedIdTracker, FTMS_FEATURE_VALUE, LEGACY_ADVERTISING_CAPACITY, NewArrivals,
         cps_has_value, ftms_has_value, hrs_has_value, initial_notification,
-        legacy_advertising_size, local_name, reading_for_advertised_bike, serial_number,
-        serialize_cps, serialize_ftms, serialize_hrs, wrap_u16,
+        legacy_advertising_size, local_name, serial_number, serialize_cps, serialize_ftms,
+        serialize_hrs, wrap_u16,
     };
-    use crate::stats::{KeiserStats, current_reading, next_reading};
+    use crate::stats::{Fleet, KeiserStats, current_snapshot, next_snapshot};
     use bluer::{
         adv::{Advertisement, AdvertisementHandle},
         gatt::local::{
@@ -22,6 +22,7 @@ mod linux_impl {
     };
     use futures_util::FutureExt;
     use std::collections::BTreeSet;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::watch;
 
@@ -106,15 +107,15 @@ mod linux_impl {
     /// re-serializes and notifies on every stats change or poll tick until the
     /// client disconnects or the stats sender is dropped.
     ///
-    /// Only the advertised bike's readings go out — the client paired to a
-    /// named bike, and the channel carries every bike in range. See
-    /// [`reading_for_advertised_bike`].
+    /// Only the advertised bike's reading goes out — the client paired to a
+    /// named bike, and the snapshot carries every bike in range. Re-sending
+    /// that reading on every tick is what lets it decay to zero on staleness.
     ///
     /// Every payload it sends, the first one included, is built from sanitized
     /// stats — see [`initial_notification`].
     fn spawn_notify_loop<F>(
         name: &'static str,
-        mut rx: watch::Receiver<KeiserStats>,
+        mut rx: watch::Receiver<Arc<Fleet>>,
         advertised_id: watch::Receiver<Option<u8>>,
         mut notifier: CharacteristicNotifier,
         has_value: fn(&KeiserStats) -> bool,
@@ -125,20 +126,23 @@ mod linux_impl {
         tokio::spawn(async move {
             tracing::info!("GATT: Client subscribed to {}", name);
 
-            let initial = current_reading(&mut rx);
-            let mut kept = reading_for_advertised_bike(None, initial, *advertised_id.borrow());
-            if let Some(initial) = &kept
-                && let Some(payload) = initial_notification(initial, has_value, &mut serialize)
+            // The advertised id is read fresh each time and the guard dropped
+            // before any await; the channel is a shared cell here, not a
+            // stream.
+            let advertised = |advertised_id: &watch::Receiver<Option<u8>>| *advertised_id.borrow();
+
+            let initial = current_snapshot(&mut rx);
+            if let Some(reading) = advertised(&advertised_id).and_then(|id| initial.get(&id))
+                && let Some(payload) = initial_notification(reading, has_value, &mut serialize)
             {
                 let _ = notifier.notify(payload).await;
             }
 
-            while let Some(stats) = next_reading(&mut rx, NOTIFY_POLL_INTERVAL).await {
-                kept = reading_for_advertised_bike(kept, stats, *advertised_id.borrow());
-                let Some(stats) = &kept else {
+            while let Some(fleet) = next_snapshot(&mut rx, NOTIFY_POLL_INTERVAL).await {
+                let Some(reading) = advertised(&advertised_id).and_then(|id| fleet.get(&id)) else {
                     continue; // nothing from the advertised bike yet
                 };
-                let stats = stats.clone().sanitized();
+                let stats = reading.sanitized();
                 if let Err(e) = notifier.notify(serialize(&stats)).await {
                     tracing::debug!("{} notification failed: {}, removing subscriber", name, e);
                     break;
@@ -188,7 +192,7 @@ mod linux_impl {
     fn notify_characteristic<F>(
         uuid: bluer::Uuid,
         name: &'static str,
-        stats_rx: watch::Receiver<KeiserStats>,
+        stats_rx: watch::Receiver<Arc<Fleet>>,
         advertised_id: watch::Receiver<Option<u8>>,
         has_value: fn(&KeiserStats) -> bool,
         make_serializer: F,
@@ -233,7 +237,7 @@ mod linux_impl {
     }
 
     fn build_application(
-        stats_rx: &watch::Receiver<KeiserStats>,
+        stats_rx: &watch::Receiver<Arc<Fleet>>,
         advertised_id: &watch::Receiver<Option<u8>>,
     ) -> Application {
         Application {
@@ -446,7 +450,7 @@ mod linux_impl {
     pub async fn run(
         session: bluer::Session,
         cancel_token: tokio_util::sync::CancellationToken,
-        stats_rx: watch::Receiver<KeiserStats>,
+        stats_rx: watch::Receiver<Arc<Fleet>>,
     ) -> Result<(), BoxError> {
         tracing::info!("Initializing BLE GATT server via bluer...");
 
@@ -479,20 +483,20 @@ mod linux_impl {
         let mut arrivals = NewArrivals::default();
         let mut advertisement: Option<AdvertisingHandle> = None;
 
-        if let Some(bike_id) = arrivals.bike_id_if_new(&current_reading(&mut stats_rx)) {
+        for bike_id in arrivals.new_in(&current_snapshot(&mut stats_rx)) {
             tracker.observe(bike_id, tokio::time::Instant::now());
         }
         tracing::info!("Waiting for a bike before advertising...");
 
         loop {
-            let reading = tokio::select! {
+            let snapshot = tokio::select! {
                 _ = cancel_token.cancelled() => break,
-                reading = next_reading(&mut stats_rx, NOTIFY_POLL_INTERVAL) => reading,
+                snapshot = next_snapshot(&mut stats_rx, NOTIFY_POLL_INTERVAL) => snapshot,
             };
             let now = tokio::time::Instant::now();
-            match reading {
-                Some(stats) => {
-                    if let Some(bike_id) = arrivals.bike_id_if_new(&stats) {
+            match snapshot {
+                Some(fleet) => {
+                    for bike_id in arrivals.new_in(&fleet) {
                         tracker.observe(bike_id, now);
                     }
                 }
