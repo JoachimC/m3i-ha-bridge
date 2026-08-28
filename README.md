@@ -124,7 +124,7 @@ Test vectors for the protocol parser come from real `btmon` captures in `doc/sam
 Because the GATT server is `cfg(target_os = "linux")`, it never compiles on a Mac. Two things cover that gap:
 
 - **Devcontainer** (`.devcontainer/`): open the repo in a Linux container to compile, test and lint the bluer path locally, with rust-analyzer seeing the Linux cfg. Note the container has no Bluetooth hardware — it's for building and testing, not running against a real adapter; that still needs the Pi.
-- **CI** (`.github/workflows/ci.yml`): every push runs `cargo clippy --all-targets -- -D warnings` and `cargo test` on a Linux runner.
+- **CI** (`.github/workflows/ci.yml`): every push runs `cargo clippy --all-targets -- -D warnings` and `cargo test` on a Linux runner, and again on a macOS runner so the btleplug half of the crate is compiled too.
 
 ## Bike Selection
 
