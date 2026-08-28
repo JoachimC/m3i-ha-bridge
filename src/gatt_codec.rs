@@ -33,48 +33,95 @@ pub fn serial_number(bike_id: Option<u8>) -> String {
 /// name only changes when a different bike has genuinely taken over.
 pub const ADVERTISED_ID_HOLD: Duration = Duration::from_secs(10);
 
+/// How recently a candidate bike must have been heard when the hold elapses.
+/// The M3i advertises every ~2 s while it is pedalled, so a bike that has
+/// genuinely taken over is heard well inside this window; one that sent a
+/// single packet and fell silent is not.
+pub const CANDIDATE_RECENCY: Duration = Duration::from_secs(5);
+
 /// Decides which bike id the advertisement should carry.
 ///
 /// The first bike heard is advertised at once — before it there is nothing to
-/// advertise. After that, a different id has to persist for
-/// [`ADVERTISED_ID_HOLD`] before it replaces the advertised one.
+/// advertise. After that, a different id replaces the advertised one only when
+/// it has been heard for at least [`ADVERTISED_ID_HOLD`] and is still being
+/// heard (within [`CANDIDATE_RECENCY`]) — a bike that has taken over, rather
+/// than one that sent a stray packet.
 #[derive(Debug, Default)]
 pub struct AdvertisedIdTracker {
     advertised: Option<u8>,
-    /// The most recent id that differs from the advertised one, and when it
-    /// was first seen.
-    candidate: Option<(u8, Instant)>,
+    candidate: Option<Candidate>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    bike_id: u8,
+    first_seen: Instant,
+    last_seen: Instant,
 }
 
 impl AdvertisedIdTracker {
-    /// Records the latest reading's bike id.
+    /// Records a sighting of a bike.
     pub fn observe(&mut self, bike_id: u8, now: Instant) {
         if self.advertised == Some(bike_id) {
             self.candidate = None;
             return;
         }
-        match self.candidate {
-            Some((id, _)) if id == bike_id => {}
-            _ => self.candidate = Some((bike_id, now)),
+        match &mut self.candidate {
+            Some(candidate) if candidate.bike_id == bike_id => candidate.last_seen = now,
+            _ => {
+                self.candidate = Some(Candidate {
+                    bike_id,
+                    first_seen: now,
+                    last_seen: now,
+                })
+            }
         }
     }
 
     /// The id the advertisement should switch to now, if any. Calling this
     /// commits the switch, so the caller must go on to register it.
     pub fn take_due(&mut self, now: Instant) -> Option<u8> {
-        let (id, since) = self.candidate?;
-        let due = self.advertised.is_none() || now.duration_since(since) >= ADVERTISED_ID_HOLD;
+        let candidate = self.candidate?;
+        let due = self.advertised.is_none()
+            || (now.duration_since(candidate.first_seen) >= ADVERTISED_ID_HOLD
+                && now.duration_since(candidate.last_seen) <= CANDIDATE_RECENCY);
         if !due {
             return None;
         }
         self.candidate = None;
-        self.advertised = Some(id);
-        Some(id)
+        self.advertised = Some(candidate.bike_id);
+        Some(candidate.bike_id)
     }
 
     #[cfg(test)]
     pub fn advertised(&self) -> Option<u8> {
         self.advertised
+    }
+}
+
+/// Lets only readings that actually arrived through to the advertising
+/// tracker.
+///
+/// The watch channel re-delivers its current value on every poll timeout so
+/// consumers can watch a reading go stale. For the tracker that is poison: a
+/// single packet from a neighbouring bike, re-delivered once a second while
+/// the advertised bike's rider coasts, would look like that bike being
+/// present for the whole hold and steal the advertisement. A reading counts
+/// as a sighting only when its receive timestamp differs from the last one.
+#[derive(Debug, Default)]
+pub struct NewArrivals {
+    last_seen: Option<std::time::Instant>,
+}
+
+impl NewArrivals {
+    /// The bike id of `stats` if this is a reading not seen before.
+    pub fn bike_id_if_new(&mut self, stats: &KeiserStats) -> Option<u8> {
+        let bike_id = stats.bike_id()?;
+        if stats.last_updated == self.last_seen {
+            return None;
+        }
+        self.last_seen = stats.last_updated;
+        Some(bike_id)
     }
 }
 
@@ -379,6 +426,58 @@ mod tests {
     }
 
     #[test]
+    fn given_the_channels_initial_value_when_filtered_then_it_is_not_a_sighting() {
+        let mut arrivals = NewArrivals::default();
+        assert_eq!(arrivals.bike_id_if_new(&KeiserStats::default()), None);
+    }
+
+    #[test]
+    fn given_a_reading_delivered_again_by_the_poll_when_filtered_then_it_counts_once() {
+        // One stray packet from bike 7 re-delivered every second must not read
+        // as bike 7 being present for ten seconds.
+        let mut arrivals = NewArrivals::default();
+        let stray = reading_from(7, 50);
+        assert_eq!(arrivals.bike_id_if_new(&stray), Some(7));
+        assert_eq!(arrivals.bike_id_if_new(&stray), None);
+        assert_eq!(arrivals.bike_id_if_new(&stray), None);
+    }
+
+    #[test]
+    fn given_a_fresh_reading_when_filtered_then_it_is_a_sighting() {
+        let mut arrivals = NewArrivals::default();
+        let first = reading_from(42, 150);
+        let second = KeiserStats {
+            last_updated: Some(std::time::Instant::now() + Duration::from_secs(2)),
+            ..reading_from(42, 160)
+        };
+        assert_eq!(arrivals.bike_id_if_new(&first), Some(42));
+        assert_eq!(arrivals.bike_id_if_new(&second), Some(42));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_stray_packet_while_the_rider_coasts_when_the_hold_elapses_then_the_advertisement_stays()
+     {
+        // The end-to-end shape of the defect: bike 42 is advertised, its rider
+        // stops pedalling, one packet from bike 7 arrives, and the channel
+        // re-delivers it once a second for longer than the hold.
+        let mut arrivals = NewArrivals::default();
+        let mut tracker = AdvertisedIdTracker::default();
+        let bike_42 = reading_from(42, 150);
+        tracker.observe(arrivals.bike_id_if_new(&bike_42).unwrap(), Instant::now());
+        tracker.take_due(Instant::now());
+
+        let stray = reading_from(7, 50);
+        for _ in 0..15 {
+            if let Some(id) = arrivals.bike_id_if_new(&stray) {
+                tracker.observe(id, Instant::now());
+            }
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert_eq!(tracker.take_due(Instant::now()), None);
+        }
+        assert_eq!(tracker.advertised(), Some(42));
+    }
+
+    #[test]
     fn given_no_bike_heard_when_the_serial_number_is_read_then_it_is_empty() {
         assert_eq!(serial_number(None), "");
         assert_eq!(serial_number(Some(7)), "007");
@@ -421,6 +520,36 @@ mod tests {
         tracker.observe(2, Instant::now());
         assert_eq!(tracker.take_due(Instant::now()), Some(2));
         assert_eq!(tracker.advertised(), Some(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_lone_packet_from_another_bike_when_the_hold_elapses_then_nothing_is_due() {
+        // Bike 7 sent one packet and fell silent. It was "the latest" for the
+        // whole hold, but it has not taken over — the rider on bike 1 is just
+        // coasting.
+        let mut tracker = AdvertisedIdTracker::default();
+        tracker.observe(1, Instant::now());
+        tracker.take_due(Instant::now());
+
+        tracker.observe(7, Instant::now());
+        tokio::time::advance(ADVERTISED_ID_HOLD + Duration::from_secs(1)).await;
+        assert_eq!(tracker.take_due(Instant::now()), None);
+        assert_eq!(tracker.advertised(), Some(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_bike_heard_throughout_the_hold_when_it_elapses_then_it_takes_over() {
+        // The genuine switch: bike 7 keeps advertising every 2 s while bike 1
+        // is silent.
+        let mut tracker = AdvertisedIdTracker::default();
+        tracker.observe(1, Instant::now());
+        tracker.take_due(Instant::now());
+
+        for _ in 0..6 {
+            tracker.observe(7, Instant::now());
+            tokio::time::advance(Duration::from_secs(2)).await;
+        }
+        assert_eq!(tracker.take_due(Instant::now()), Some(7));
     }
 
     #[tokio::test(start_paused = true)]

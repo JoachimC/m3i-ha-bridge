@@ -7,10 +7,10 @@
 mod linux_impl {
     use crate::BoxError;
     use crate::gatt_codec::{
-        AdvertisedIdTracker, FTMS_FEATURE_VALUE, LEGACY_ADVERTISING_CAPACITY, cps_has_value,
-        ftms_has_value, hrs_has_value, initial_notification, legacy_advertising_size, local_name,
-        reading_for_advertised_bike, serial_number, serialize_cps, serialize_ftms, serialize_hrs,
-        wrap_u16,
+        AdvertisedIdTracker, FTMS_FEATURE_VALUE, LEGACY_ADVERTISING_CAPACITY, NewArrivals,
+        cps_has_value, ftms_has_value, hrs_has_value, initial_notification,
+        legacy_advertising_size, local_name, reading_for_advertised_bike, serial_number,
+        serialize_cps, serialize_ftms, serialize_hrs, wrap_u16,
     };
     use crate::stats::{KeiserStats, current_reading, next_reading};
     use bluer::{
@@ -454,9 +454,10 @@ mod linux_impl {
         // different bike has held the "latest" slot long enough to take over.
         let mut stats_rx = stats_rx;
         let mut tracker = AdvertisedIdTracker::default();
+        let mut arrivals = NewArrivals::default();
         let mut advertisement: Option<AdvertisingHandle> = None;
 
-        if let Some(bike_id) = current_reading(&mut stats_rx).bike_id() {
+        if let Some(bike_id) = arrivals.bike_id_if_new(&current_reading(&mut stats_rx)) {
             tracker.observe(bike_id, tokio::time::Instant::now());
         }
         tracing::info!("Waiting for a bike before advertising...");
@@ -469,7 +470,7 @@ mod linux_impl {
             let now = tokio::time::Instant::now();
             match reading {
                 Some(stats) => {
-                    if let Some(bike_id) = stats.bike_id() {
+                    if let Some(bike_id) = arrivals.bike_id_if_new(&stats) {
                         tracker.observe(bike_id, now);
                     }
                 }
