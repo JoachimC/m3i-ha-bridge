@@ -135,6 +135,13 @@ async fn main() -> Result<(), BoxError> {
         token_clone.cancel();
     });
 
+    // Before anything is spawned: if there is no usable Bluetooth stack the
+    // process exits here, and a publisher spawned earlier would never run its
+    // shutdown handshake. One platform handle for the whole process: on Linux
+    // the scanner and the GATT server then share a single bluer session
+    // rather than opening two.
+    let platform = std::sync::Arc::new(BlePlatform::new().await?);
+
     // The bluetooth reader is the single producer on this watch channel; each
     // publisher (BLE GATT, MQTT) consumes its own receiver independently.
     let (stats_tx, stats_rx) = tokio::sync::watch::channel(stats::KeiserStats::default());
@@ -152,10 +159,6 @@ async fn main() -> Result<(), BoxError> {
             None
         }
     };
-
-    // One platform handle for the whole process: on Linux the scanner and the
-    // GATT server then share a single bluer session rather than opening two.
-    let platform = std::sync::Arc::new(BlePlatform::new().await?);
 
     let gatt_cancel_token = cancel_token.clone();
     let main_cancel_token = cancel_token.clone();
@@ -178,15 +181,17 @@ async fn main() -> Result<(), BoxError> {
     }
 
     let retry_strategy = ExponentialBackoff::new(RETRY_DURATION, MAX_RETRY_DURATION);
-    let stats_tx_clone = stats_tx.clone();
     let run_bridge_wrapper = move |token: CancellationToken| {
-        let tx = stats_tx_clone.clone();
+        let tx = stats_tx.clone();
         // Cheap per attempt: on Linux this clones the shared session rather
         // than opening a new D-Bus connection every five seconds.
         let scanner = platform.scanner();
         async move { run_bridge(&scanner, token, tx, bike_id_filter).await }
     };
 
+    // `bridge_loop` takes the wrapper — and with it the last sender — by
+    // value, so when it returns the channel closes. That is what lets the
+    // publishers tell "the reader has stopped for good" from "no packet yet".
     bridge_loop(run_bridge_wrapper, cancel_token, retry_strategy).await;
 
     let mut failures = Vec::new();
@@ -422,6 +427,32 @@ mod tests {
         let message = status.unwrap_err().to_string();
         assert!(message.contains("GATT server"), "{message}");
         assert!(message.contains("MQTT publisher"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn given_the_bridge_loop_owns_the_last_sender_when_it_returns_then_the_channel_closes() {
+        // What makes the publishers' "producer gone" branches reachable: main
+        // moves its only sender into the wrapper, and bridge_loop takes the
+        // wrapper by value. Holding a sender in main would keep the channel
+        // open forever and turn those branches into dead code.
+        let (stats_tx, mut stats_rx) = tokio::sync::watch::channel(stats::KeiserStats::default());
+        let cancel_token = CancellationToken::new();
+        let token_clone = cancel_token.clone();
+        let wrapper = move |_token: CancellationToken| {
+            let _tx = stats_tx.clone();
+            let token = token_clone.clone();
+            async move {
+                token.cancel();
+                Ok(RunStatus::Cancelled)
+            }
+        };
+
+        bridge_loop(wrapper, cancel_token, NoopStrategy).await;
+
+        assert!(
+            stats_rx.changed().await.is_err(),
+            "the channel must be closed once the loop has returned"
+        );
     }
 
     #[tokio::test]
