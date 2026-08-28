@@ -20,6 +20,7 @@ mod advertising;
 mod between_retries_strategy;
 mod ble_platform;
 mod bluetooth_hal;
+mod config;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod gatt_codec;
 #[cfg(target_os = "linux")]
@@ -176,7 +177,7 @@ async fn main() -> Result<(), BoxError> {
 
     // Read once at startup rather than per advertisement: this is on the hot
     // path, at roughly 2 Hz per bike in range.
-    let bike_id_filter = keiser::bike_id_filter(|key| std::env::var(key).ok());
+    let bike_id_filter = config::bike_id_filter(|key| std::env::var(key).ok());
     match bike_id_filter {
         Some(bike_id) => tracing::info!("Only accepting advertisements from bike {}", bike_id),
         None => tracing::info!("Accepting advertisements from any Keiser M3i in range"),
