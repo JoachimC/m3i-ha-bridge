@@ -1,6 +1,6 @@
 //! The only place that knows which Bluetooth stack this build uses.
 //!
-//! Everything else — `main`, `bluetooth_hal`, `gatt_server`'s public entry
+//! Everything else — `main`, `bridge`, `gatt_server`'s public entry
 //! point — is written against this, so the `cfg` split does not spread.
 
 use tokio::sync::watch;

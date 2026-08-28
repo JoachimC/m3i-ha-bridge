@@ -91,7 +91,8 @@ The Bluetooth reader is the single producer: it parses Keiser advertisements int
 |---|---|
 | `stats.rs` | The `KeiserStats` domain model and staleness/sanitization rules |
 | `keiser.rs` | Pure parser for the M3i advertising protocol (see `doc/bluetooth-protocol.md`) |
-| `bluetooth_hal.rs` | Platform-independent scanning: the `BleScanner` trait, advertisement filtering, feeding the watch channel |
+| `ble_scanner.rs` | The `BleScanner` trait and what a scan yields; the shared scan-restart constants |
+| `bridge.rs` | The reader: decodes each Keiser advertisement, applies the bike filter, records it in the fleet |
 | `scan_bluer.rs` | BLE scanning via `bluer` — Linux only |
 | `scan_btleplug.rs` | BLE scanning via `btleplug` — everywhere else |
 | `ble_platform.rs` | The only module that knows which Bluetooth stack this build uses |
