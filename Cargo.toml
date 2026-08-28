@@ -1,0 +1,97 @@
+[package]
+name = "m3i-ha-bridge"
+version = "0.1.0"
+edition = "2024"
+description = "Bridges a Keiser M3i spin bike's BLE broadcasts to a standard GATT server (FTMS/CPS/HRS) and to Home Assistant over MQTT"
+authors = ["Joachim Chapman"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/JoachimC/m3i-ha-bridge"
+readme = "README.md"
+keywords = ["keiser", "home-assistant", "mqtt", "bluetooth", "ftms"]
+categories = ["command-line-utilities", "hardware-support"]
+# Binary-only crate distributed as GitHub Releases, not on crates.io.
+publish = false
+# Edition 2024 alone needs 1.85, but `let` chains (`bluetooth_hal.rs`) were only
+# stabilised for it in 1.88 — verified by compiling on 1.87, which rejects them
+# with E0658. Declaring it turns a confusing mid-build error on an older
+# toolchain into "package requires rustc 1.88". The `msrv` CI job holds it true.
+rust-version = "1.88"
+
+[dependencies]
+# Only what the crate actually uses, rather than `full`. `rt` covers the
+# current-thread runtime and `tokio::spawn`; `process` is the btmgmt fallback in
+# gatt_server; `net` and `io-util` are needed by rumqttc and the D-Bus stack.
+# `full` additionally pulls in `fs`, `io-std` and `rt-multi-thread`, none of
+# which are reachable from this binary.
+tokio = { version = "1", features = [
+    "rt",
+    "macros",
+    "time",
+    "sync",
+    "signal",
+    "process",
+    "net",
+    "io-util",
+] }
+# Only FutureExt::boxed, Stream and StreamExt are used; the `futures` facade
+# additionally pulls in the executor, channel and sink crates.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tracing = "0.1"
+# No `env-filter`: it pulls in `matchers` + `regex-automata` + `regex-syntax`,
+# and `fmt::init()` still honours RUST_LOG without it, via a `Targets` filter
+# that supports per-target directives such as `RUST_LOG=info,bike_stats=trace`.
+# What is given up is EnvFilter's span and field directives, which nothing here
+# uses.
+tracing-subscriber = "0.3"
+tokio-util = "0.7.18"
+async-stream = "0.3"
+rumqttc = { version = "0.24", default-features = false }
+serde_json = "1"
+
+
+[dev-dependencies]
+hex-literal = "1.1.0"
+# rumqttc's request channel, so tests can stand in for the event loop via
+# AsyncClient::from_senders and inspect what a publish actually queued.
+flume = { version = "0.11", default-features = false }
+# Make sure test-util is present so start_paused can be parsed!
+tokio = { version = "1.0", features = ["rt", "macros", "test-util"] }
+
+# btleplug is the scanner everywhere except Linux, which uses bluer instead.
+# Target-gating it keeps it out of the Pi binary entirely, taking futures, uuid,
+# serde, dashmap and the rest of its tree with it.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+btleplug = "0.12"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Not used directly: `vendored` forces libdbus to be built from source so the
+# musl target links it statically, rather than expecting a system libdbus that
+# a static binary cannot use.
+libdbus-sys = { version = "0.2", features = ["vendored"] }
+bluer = { version = "0.17", features = ["bluetoothd"] }
+
+[profile.release]
+# Every knob here was measured on the real deploy target
+# (arm-unknown-linux-musleabihf, built with cross), keeping only what paid:
+#
+#   lto = "thin", strip                    3,252,616   starting point
+#   lto = "fat"                            2,826,632   -426 KB
+#   + codegen-units = 1                    2,711,944   -115 KB
+#   + opt-level = "s"                      2,032,008   -680 KB
+#   + opt-level = "z"                      1,790,344   -922 KB  (chosen)
+#   + panic = "abort"                      1,528,208   -262 KB
+#
+# opt-level "z" is sometimes worse than "s" on ARM, hence measuring both: here
+# it wins by 242 KB.
+#
+# panic = "abort" is a deliberate behaviour change, not just a size knob. With
+# unwinding, a panic inside a spawned task -- a GATT notify loop, say -- kills
+# only that task, so a subscriber silently stops receiving notifications and
+# the process carries on looking healthy. Aborting turns that into a restart,
+# which with Restart=always in the unit is the outcome you want. Tests are
+# unaffected: they build with the dev profile, which still unwinds.
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

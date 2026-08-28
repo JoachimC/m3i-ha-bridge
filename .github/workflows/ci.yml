@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only by default; the release job below raises this for itself only.
+# Third-party actions are pinned to commit SHAs (the tag is in the comment) so
+# a moved tag cannot change what runs with the release token.
+permissions:
+  contents: read
+
+# A newer push to the same branch/PR supersedes the run in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - run: cargo fmt --check
+      # Runs on Linux, so this covers the bluer GATT path that never
+      # compiles on macOS dev machines.
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      # Deliberately after the tests, and deliberately not --all-targets: this
+      # is the only step that builds without dev-dependencies. `tokio` is
+      # declared with a trimmed feature list, but the dev-dependency asks for
+      # `full`, so every other step unifies the missing features back in and a
+      # feature the binary actually needs would go unnoticed until a release
+      # build on the Pi.
+      - run: cargo build
+      # And the only step that exercises the release profile, whose fat LTO and
+      # codegen-units = 1 can surface link errors that a debug build never
+      # reaches. Slow, but cheaper than finding out during a deploy.
+      - run: cargo build --release
+
+  # Builds the release binaries and publishes them as one GitHub Release, so
+  # a deploy never depends on whichever working tree happened to be on the dev
+  # machine, and rolling back is "download an earlier tag". One build job per
+  # target, then a single release job: parallel jobs each calling the release
+  # action would race to create the same tag.
+  build:
+    needs: check
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        target:
+          - arm-unknown-linux-musleabihf   # Pi Zero / 1 / 2 (32-bit ARMv6)
+          - aarch64-unknown-linux-musl     # Pi 3/4/5 on a 64-bit OS
+          - x86_64-unknown-linux-musl      # PCs and VMs
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # Must precede the build: cross bakes this into the binary. Derived from
+      # the commit and the date, so every matrix job computes the same value.
+      - name: Compute build version
+        run: echo "BUILD_VERSION=$(date -u +%Y-%m-%d)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      # cross runs the *host* rustup toolchain inside its container (it mounts
+      # the sysroot read-only), so this is what actually compiles edition 2024.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      # cross mounts the host CARGO_HOME and ./target into the container, so
+      # container builds do populate the directories this caches. cache-bin is
+      # off so it never fights install-action over ~/.cargo/bin/cross.
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: ${{ matrix.target }}
+          cache-bin: false
+
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
+        with:
+          tool: cross
+
+      # No CROSS_CONTAINER_OPTS here: deploy.sh needs --platform linux/amd64
+      # only because the dev Mac is arm64 and the cross images are amd64-only.
+      # ubuntu-latest is already x64, so it would be a no-op.
+      - name: Cross-build static musl binary
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          BIN="m3i-ha-bridge-${BUILD_VERSION}-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/m3i-ha-bridge" "$BIN"
+          sha256sum "$BIN" > "$BIN.sha256"
+          file "$BIN"
+          # If this prints "dev", Cross.toml's build.env.passthrough is not
+          # reaching the container and every release would be unidentifiable.
+          strings "$BIN" | grep -qF "$BUILD_VERSION" \
+            || { echo "::error::BUILD_VERSION was not baked into the binary"; exit 1; }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.target }}
+          path: m3i-ha-bridge-*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    # Creating the release needs write access; scoped to this job so every
+    # other job keeps the workflow-level read-only token.
+    permissions:
+      contents: write
+    steps:
+      # Only for OSMFEULA.txt, which ships alongside the binaries because the
+      # Maintenance Fee terms attach to the Binary Release, not the source.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          sparse-checkout: OSMFEULA.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Compute build version
+        run: echo "BUILD_VERSION=$(date -u +%Y-%m-%d)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          merge-multiple: true
+
+      # A build that spanned midnight UTC would have a stale date in the
+      # artifact names; refuse to publish rather than tag the wrong thing.
+      - name: Check every artifact carries this version
+        run: |
+          ls -l
+          for f in m3i-ha-bridge-*; do
+            case "$f" in m3i-ha-bridge-${BUILD_VERSION}-*) ;; *)
+              echo "::error::$f does not match BUILD_VERSION=$BUILD_VERSION"; exit 1;;
+            esac
+          done
+
+      - uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3
+        with:
+          tag_name: ${{ env.BUILD_VERSION }}
+          # Pin the tag to the commit that was actually built, rather than
+          # whatever the branch tip happens to be when the API call lands.
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
+          files: |
+            m3i-ha-bridge-*-unknown-linux-musl*
+            m3i-ha-bridge-*.sha256
+            OSMFEULA.txt
+
+  # Keeps `rust-version` in Cargo.toml honest. Without this the field is a
+  # guess: the crate builds fine on stable whether the true floor is 1.85 or
+  # 1.88, so only compiling on the declared version proves the claim.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: msrv
+      - run: cargo check --all-targets

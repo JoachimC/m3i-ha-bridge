@@ -1,0 +1,16 @@
+# Rust/Cargo
+/target/
+
+# IDE / tooling (per-developer)
+.idea/
+.claude/settings.json
+mcp_config.json
+
+# Secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+
+# OS
+.DS_Store

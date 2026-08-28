@@ -1,0 +1,11 @@
+{
+  "name": "m3i-ha-bridge",
+  "image": "mcr.microsoft.com/devcontainers/rust:1",
+  // Edition 2024 needs a recent stable; the image's toolchain can lag behind.
+  "postCreateCommand": "rustup update stable",
+  "customizations": {
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer"]
+    }
+  }
+}

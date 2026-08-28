@@ -1,0 +1,11 @@
+# `cross` forwards no host environment variables into the build container by
+# default — a deliberate safety choice on its part, but it means CI's
+# BUILD_VERSION never reaches rustc and `option_env!("BUILD_VERSION")` compiles
+# to None. The startup log would then report "dev" for every published build,
+# and nothing would fail: the binary builds, the release publishes, and the one
+# thing the version exists for silently does not work.
+#
+# This file is inert for plain `cargo build` and `cargo clippy`, so it affects
+# only the cross-compiled path — CI's release job and ./deploy.sh alike.
+[build.env]
+passthrough = ["BUILD_VERSION"]
