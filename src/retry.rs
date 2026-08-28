@@ -1,26 +1,25 @@
+//! How long to wait between attempts of the Bluetooth reader.
+
 use std::future::Future;
-use std::sync::Mutex;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, PartialEq)]
-pub enum BetweenRetriesResult {
+pub enum Wait {
     Finished,
     Cancelled,
 }
 
-pub trait BetweenRetriesStrategy {
+/// Decides the pause before the next attempt.
+pub trait RetryDelay {
+    /// Waits before the next attempt. `last_attempt` is how long the attempt
+    /// that just ended ran, so the strategy can tell a fresh failure after
+    /// hours of health from the next failure in a run of them.
     fn wait(
-        &self,
+        &mut self,
+        last_attempt: Duration,
         cancel_token: CancellationToken,
-    ) -> impl Future<Output = BetweenRetriesResult> + Send;
-
-    /// Called when an attempt ran long enough to count as healthy, so a
-    /// backoff built up by a spell of failures does not outlive it.
-    ///
-    /// Defaulted to nothing, because a strategy with no state has nothing to
-    /// forget.
-    fn reset(&self) {}
+    ) -> impl Future<Output = Wait> + Send;
 }
 
 /// Exponential backoff with jitter.
@@ -32,16 +31,18 @@ pub trait BetweenRetriesStrategy {
 /// on an SD card. Doubling to a cap keeps the first retry fast — which is what
 /// matters for a transient fault — while making a permanent one cheap to leave
 /// running until someone can look at it.
-pub struct ExponentialBackoff {
+pub struct Backoff {
     initial: Duration,
     max: Duration,
+    /// An attempt that ran at least this long was talking to a working
+    /// adapter, so whatever went wrong is a fresh problem rather than a
+    /// continuation of an earlier one: the schedule starts over instead of
+    /// inheriting a backoff built up hours ago. The adapter-missing case fails
+    /// in milliseconds and so never qualifies, which is the whole point.
+    healthy_after: Duration,
     /// Fraction of each delay that jitter may remove, e.g. `0.1` for "up to
     /// 10% shorter".
     jitter: f64,
-    state: Mutex<BackoffState>,
-}
-
-struct BackoffState {
     /// Delay for the next `wait`, before jitter.
     next: Duration,
     rng: u64,
@@ -52,52 +53,52 @@ struct BackoffState {
 /// that restarts on the same timer — bluetoothd, most obviously.
 const DEFAULT_JITTER: f64 = 0.1;
 
-impl ExponentialBackoff {
-    pub fn new(initial: Duration, max: Duration) -> Self {
-        Self::with_seed(initial, max, DEFAULT_JITTER, random_seed())
+impl Backoff {
+    pub fn new(initial: Duration, max: Duration, healthy_after: Duration) -> Self {
+        Self::with_seed(initial, max, healthy_after, DEFAULT_JITTER, random_seed())
     }
 
-    /// Construction with an explicit jitter fraction and PRNG seed, so tests
-    /// are deterministic. A zero seed would make the generator produce nothing
-    /// but zeroes, so it is nudged odd.
-    pub fn with_seed(initial: Duration, max: Duration, jitter: f64, seed: u64) -> Self {
+    fn with_seed(
+        initial: Duration,
+        max: Duration,
+        healthy_after: Duration,
+        jitter: f64,
+        seed: u64,
+    ) -> Self {
         Self {
             initial,
             max,
+            healthy_after,
             jitter,
-            state: Mutex::new(BackoffState {
-                next: initial,
-                rng: seed | 1,
-            }),
+            next: initial,
+            rng: nonzero_seed(seed),
         }
     }
 
-    /// Takes the next delay and advances the schedule.
-    ///
-    /// Deliberately not `async`: the lock must be released before anything is
-    /// awaited.
-    fn take_delay(&self) -> Duration {
-        let mut state = self.state.lock().expect("backoff state poisoned");
-        let base = state.next;
-        state.next = base.saturating_mul(2).min(self.max);
-        let random = next_random(&mut state.rng);
-        drop(state);
-        apply_jitter(base, self.jitter, random)
+    /// The delay for the attempt that just ended, advancing the schedule.
+    fn next_delay(&mut self, last_attempt: Duration) -> Duration {
+        if last_attempt >= self.healthy_after {
+            self.next = self.initial;
+        }
+        let base = self.next;
+        self.next = base.saturating_mul(2).min(self.max);
+        apply_jitter(base, self.jitter, next_random(&mut self.rng))
     }
 }
 
-impl BetweenRetriesStrategy for ExponentialBackoff {
-    async fn wait(&self, cancel_token: CancellationToken) -> BetweenRetriesResult {
-        let delay = self.take_delay();
+impl RetryDelay for Backoff {
+    async fn wait(&mut self, last_attempt: Duration, cancel_token: CancellationToken) -> Wait {
+        let delay = self.next_delay(last_attempt);
         tokio::select! {
-            _ = cancel_token.cancelled() => BetweenRetriesResult::Cancelled,
-            _ = tokio::time::sleep(delay) => BetweenRetriesResult::Finished,
+            _ = cancel_token.cancelled() => Wait::Cancelled,
+            _ = tokio::time::sleep(delay) => Wait::Finished,
         }
     }
+}
 
-    fn reset(&self) {
-        self.state.lock().expect("backoff state poisoned").next = self.initial;
-    }
+/// A zero seed would make xorshift produce nothing but zeroes.
+fn nonzero_seed(seed: u64) -> u64 {
+    seed | 1
 }
 
 /// Shortens `base` by up to `fraction` of itself.
@@ -109,9 +110,14 @@ fn apply_jitter(base: Duration, fraction: f64, random: u64) -> Duration {
     if fraction <= 0.0 {
         return base;
     }
-    // The top 53 bits give a uniform value in [0, 1) with no rounding surprises.
-    let unit = (random >> 11) as f64 / (1u64 << 53) as f64;
-    base.mul_f64(1.0 - fraction.clamp(0.0, 1.0) * unit)
+    base.mul_f64(1.0 - fraction.clamp(0.0, 1.0) * unit_interval(random))
+}
+
+/// A uniform value in [0, 1) from the top 53 bits — an f64 mantissa's worth —
+/// so there are no rounding surprises.
+fn unit_interval(random: u64) -> f64 {
+    const MANTISSA_BITS: u32 = 53;
+    (random >> (u64::BITS - MANTISSA_BITS)) as f64 / (1u64 << MANTISSA_BITS) as f64
 }
 
 /// xorshift64*. Spreading retry delays is all this is for; it is not suitable
@@ -138,27 +144,30 @@ mod tests {
 
     const INITIAL: Duration = Duration::from_secs(5);
     const MAX: Duration = Duration::from_secs(60);
+    const HEALTHY: Duration = Duration::from_secs(120);
+    /// An attempt that failed at once: the adapter-missing case.
+    const IMMEDIATE: Duration = Duration::ZERO;
 
     /// Jitter off, so the schedule is exact and the assertions are about
     /// backoff rather than about the PRNG.
-    fn backoff() -> ExponentialBackoff {
-        ExponentialBackoff::with_seed(INITIAL, MAX, 0.0, 1)
+    fn backoff() -> Backoff {
+        Backoff::with_seed(INITIAL, MAX, HEALTHY, 0.0, 1)
     }
 
     #[tokio::test(start_paused = true)]
     async fn given_no_cancellation_when_waiting_then_it_finishes_after_the_delay() {
-        let strategy = backoff();
+        let mut strategy = backoff();
         let start = tokio::time::Instant::now();
 
-        let result = strategy.wait(CancellationToken::new()).await;
+        let result = strategy.wait(IMMEDIATE, CancellationToken::new()).await;
 
-        assert_eq!(result, BetweenRetriesResult::Finished);
+        assert_eq!(result, Wait::Finished);
         assert_eq!(start.elapsed(), INITIAL);
     }
 
     #[tokio::test(start_paused = true)]
     async fn given_cancellation_during_wait_then_it_returns_cancelled_early() {
-        let strategy = ExponentialBackoff::with_seed(MAX, MAX, 0.0, 1);
+        let mut strategy = Backoff::with_seed(MAX, MAX, HEALTHY, 0.0, 1);
         let token = CancellationToken::new();
         let token_clone = token.clone();
         let start = tokio::time::Instant::now();
@@ -168,40 +177,51 @@ mod tests {
             token_clone.cancel();
         });
 
-        let result = strategy.wait(token).await;
+        let result = strategy.wait(IMMEDIATE, token).await;
 
-        assert_eq!(result, BetweenRetriesResult::Cancelled);
+        assert_eq!(result, Wait::Cancelled);
         assert!(start.elapsed() < MAX);
     }
 
     #[tokio::test(start_paused = true)]
     async fn given_repeated_failures_when_waiting_then_each_delay_doubles_up_to_the_cap() {
-        // The point of the issue: an adapter that is simply absent must not
-        // keep costing a log line every five seconds forever.
-        let strategy = backoff();
+        // An adapter that is simply absent must not keep costing a log line
+        // every five seconds forever.
+        let mut strategy = backoff();
         let expected = [5, 10, 20, 40, 60, 60, 60].map(Duration::from_secs);
 
         for (attempt, want) in expected.into_iter().enumerate() {
             let start = tokio::time::Instant::now();
-            strategy.wait(CancellationToken::new()).await;
+            strategy.wait(IMMEDIATE, CancellationToken::new()).await;
             assert_eq!(start.elapsed(), want, "attempt {}", attempt + 1);
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_a_backed_off_strategy_when_it_is_reset_then_the_next_delay_is_the_initial_one() {
-        // A bridge that ran healthily for hours before failing should retry
-        // promptly, not inherit the cap from a bad spell days earlier.
-        let strategy = backoff();
+    async fn given_a_backed_off_strategy_when_an_attempt_ran_healthily_then_the_delay_starts_over()
+    {
+        // A bridge that ran for hours before failing should retry promptly,
+        // not inherit the cap from a bad spell days earlier.
+        let mut strategy = backoff();
         for _ in 0..5 {
-            strategy.wait(CancellationToken::new()).await;
+            strategy.wait(IMMEDIATE, CancellationToken::new()).await;
         }
 
-        strategy.reset();
+        let start = tokio::time::Instant::now();
+        strategy.wait(HEALTHY, CancellationToken::new()).await;
+        assert_eq!(start.elapsed(), INITIAL);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_attempt_just_short_of_healthy_when_it_fails_then_the_backoff_is_kept() {
+        let mut strategy = backoff();
+        strategy.wait(IMMEDIATE, CancellationToken::new()).await;
 
         let start = tokio::time::Instant::now();
-        strategy.wait(CancellationToken::new()).await;
-        assert_eq!(start.elapsed(), INITIAL);
+        strategy
+            .wait(HEALTHY - Duration::from_secs(1), CancellationToken::new())
+            .await;
+        assert_eq!(start.elapsed(), INITIAL * 2);
     }
 
     #[test]
@@ -238,12 +258,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn given_any_random_when_mapped_to_the_unit_interval_then_it_is_below_one() {
+        assert_eq!(unit_interval(0), 0.0);
+        assert!(unit_interval(u64::MAX) < 1.0);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn given_jitter_is_enabled_when_waiting_then_the_delay_stays_within_bounds() {
-        let strategy = ExponentialBackoff::with_seed(INITIAL, MAX, DEFAULT_JITTER, 42);
+        let mut strategy = Backoff::with_seed(INITIAL, MAX, HEALTHY, DEFAULT_JITTER, 42);
         let start = tokio::time::Instant::now();
 
-        strategy.wait(CancellationToken::new()).await;
+        strategy.wait(IMMEDIATE, CancellationToken::new()).await;
 
         let elapsed = start.elapsed();
         assert!(
