@@ -560,8 +560,9 @@ mod linux_impl {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(format!(
-                "btmgmt {} failed: {}{}",
+                "btmgmt {} failed ({}): {}{}",
                 args.join(" "),
+                output.status,
                 stdout.trim(),
                 stderr.trim()
             )
