@@ -1,10 +1,7 @@
 //! BLE scanning everywhere except Linux, via btleplug.
 //!
 //! Linux uses bluer instead (`scan_bluer`), so this exists to keep the bridge
-//! runnable on a macOS dev machine. It is the implementation the whole project
-//! used before that port, behind the [`BleScanner`] trait.
-
-use std::time::Duration;
+//! runnable on a macOS dev machine, behind the [`BleScanner`] trait.
 
 use async_stream::stream;
 use btleplug::api::{Central, CentralEvent, Manager as _, ScanFilter};
@@ -13,12 +10,12 @@ use futures_util::stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::BoxError;
-use crate::bluetooth_hal::{Advertisement, BleScanner, ScanEvent, ScanStream};
+use crate::ble_scanner::{
+    BleScanner, ReceivedAdvertisement, SCAN_RESTART_INTERVAL, SCAN_SETTLE_DELAY, ScanEvent,
+    ScanStream,
+};
 
-const SCAN_RESTART_INTERVAL: Duration = Duration::from_secs(60);
-const SCAN_SETTLE_DELAY: Duration = Duration::from_millis(100);
-
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct BtleplugScanner;
 
 impl BleScanner for BtleplugScanner {
@@ -76,17 +73,11 @@ fn scan_stream(
                 }
                 next_event = events.next() => {
                     match next_event {
-                        // ManufacturerDataAdvertisement is the only event that
-                        // carries a freshly received advertisement; reading a
-                        // peripheral's properties would return cached data and
-                        // reset the staleness clock (issue #5).
-                        Some(CentralEvent::ManufacturerDataAdvertisement { id, manufacturer_data }) => {
-                            yield ScanEvent::Advertisement(Advertisement {
-                                device: id.to_string(),
-                                manufacturer_data,
-                            });
+                        Some(event) => {
+                            if let Some(advertisement) = to_advertisement(event) {
+                                yield ScanEvent::Advertisement(advertisement);
+                            }
                         }
-                        Some(_) => {}
                         None => {
                             yield ScanEvent::Error("Bluetooth event stream ended unexpectedly".into());
                             break;
@@ -94,6 +85,66 @@ fn scan_stream(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Maps one central event to an advertisement, if it carries one.
+///
+/// `ManufacturerDataAdvertisement` is the only event that carries a freshly
+/// received advertisement; reading a peripheral's properties would return
+/// cached data and reset the staleness clock.
+fn to_advertisement(event: CentralEvent) -> Option<ReceivedAdvertisement> {
+    match event {
+        CentralEvent::ManufacturerDataAdvertisement {
+            id,
+            manufacturer_data,
+        } => Some(ReceivedAdvertisement {
+            device: id.to_string(),
+            manufacturer_data,
+        }),
+        _ => None,
+    }
+}
+
+// btleplug's PeripheralId is opaque and only constructible from a UUID on
+// macOS, which is the platform this scanner is developed on.
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use btleplug::platform::PeripheralId;
+    use std::collections::HashMap;
+
+    fn some_peripheral() -> PeripheralId {
+        PeripheralId::from(uuid::Uuid::from_u128(0x1234))
+    }
+
+    #[test]
+    fn given_a_manufacturer_data_advertisement_when_mapped_then_an_advertisement_is_produced() {
+        let payload = HashMap::from([(0x0102u16, vec![1, 2, 3])]);
+        let event = CentralEvent::ManufacturerDataAdvertisement {
+            id: some_peripheral(),
+            manufacturer_data: payload.clone(),
+        };
+
+        let advertisement = to_advertisement(event).expect("carries an advertisement");
+
+        assert_eq!(advertisement.manufacturer_data, payload);
+        assert!(!advertisement.device.is_empty());
+    }
+
+    #[test]
+    fn given_any_other_central_event_when_mapped_then_nothing_is_produced() {
+        // Discovery, connection and RSSI events all fire constantly; only
+        // manufacturer data is an advertisement as far as this bridge is
+        // concerned.
+        for event in [
+            CentralEvent::DeviceDiscovered(some_peripheral()),
+            CentralEvent::DeviceUpdated(some_peripheral()),
+            CentralEvent::DeviceConnected(some_peripheral()),
+            CentralEvent::DeviceDisconnected(some_peripheral()),
+        ] {
+            assert!(to_advertisement(event).is_none());
         }
     }
 }

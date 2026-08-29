@@ -63,6 +63,10 @@ tokio = { version = "1.0", features = ["rt", "macros", "test-util"] }
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 btleplug = "0.12"
 
+# Only to build a btleplug PeripheralId in the scanner's tests on macOS.
+[target.'cfg(not(target_os = "linux"))'.dev-dependencies]
+uuid = "1"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # Not used directly: `vendored` forces libdbus to be built from source so the
 # musl target links it statically, rather than expecting a system libdbus that

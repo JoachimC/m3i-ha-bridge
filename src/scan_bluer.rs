@@ -6,7 +6,6 @@
 
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::time::Duration;
 
 use async_stream::stream;
 use bluer::{
@@ -17,18 +16,11 @@ use futures_util::stream::{BoxStream, SelectAll, Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::BoxError;
-use crate::bluetooth_hal::{Advertisement, BleScanner, ScanEvent, ScanStream};
+use crate::ble_scanner::{
+    BleScanner, ReceivedAdvertisement, SCAN_RESTART_INTERVAL, SCAN_SETTLE_DELAY, ScanEvent,
+    ScanStream,
+};
 
-/// BlueZ deduplicates advertising packets; periodically restarting the scan
-/// forces duplicates (i.e. fresh bike readings) to keep flowing.
-///
-/// Kept from the btleplug implementation on purpose. `duplicate_data: true`
-/// below should make it unnecessary, but that has not been confirmed on the
-/// hardware, and retiring it is a separate change with its own measurement.
-const SCAN_RESTART_INTERVAL: Duration = Duration::from_secs(60);
-const SCAN_SETTLE_DELAY: Duration = Duration::from_millis(100);
-
-#[derive(Clone)]
 pub struct BluerScanner {
     session: Session,
 }
@@ -102,18 +94,7 @@ fn scan_stream(
             }
         };
 
-        // Per-device subscriptions, fanned out in-process from the session's
-        // single PropertiesChanged match rule: no D-Bus round trip per device,
-        // and none per advertisement. btleplug did one `get_device_info` call
-        // for every manufacturer-data advertisement, purely to build an id.
-        //
-        // Both collections grow with every distinct BLE device seen. The 60 s
-        // restart bounds them as a side effect, by clearing both; if that
-        // restart is ever retired, this needs an explicit cap or a prune of
-        // devices that have produced no Keiser data.
-        let mut device_events: SelectAll<BoxStream<'static, AddressedDeviceEvent>> =
-            SelectAll::new();
-        let mut subscribed: HashSet<Address> = HashSet::new();
+        let mut subscriptions = DeviceSubscriptions::default();
 
         let mut scan_restart_timer = tokio::time::interval(SCAN_RESTART_INTERVAL);
         scan_restart_timer.tick().await;
@@ -126,17 +107,7 @@ fn scan_stream(
 
                 _ = scan_restart_timer.tick() => {
                     tracing::info!("Periodically restarting scan...");
-                    // StopDiscovery makes BlueZ delete every temporary,
-                    // non-connectable device — and the M3i is one, it sends
-                    // ADV_NONCONN_IND — so every per-device subscription dies
-                    // with the restart, and the DeviceRemoved signals arrive
-                    // while no adapter stream is held to observe them. Forget
-                    // all of it and let the fresh discovery re-announce
-                    // whatever still exists; keeping the set would leave the
-                    // bridge permanently silent after the first restart.
-                    device_events = SelectAll::new();
-                    subscribed.clear();
-                    if let Err(e) = restart_discovery(&adapter, &mut discovery).await {
+                    if let Err(e) = restart_scan(&adapter, &mut discovery, &mut subscriptions).await {
                         yield ScanEvent::Error(e);
                         break;
                     }
@@ -145,16 +116,9 @@ fn scan_stream(
                 adapter_event = discovery.next() => {
                     match adapter_event {
                         Some(AdapterEvent::DeviceAdded(address)) => {
-                            if subscribed.insert(address) {
-                                match subscribe(&adapter, address).await {
-                                    Some(events) => device_events.push(events),
-                                    // Leave it unsubscribed so a later
-                                    // DeviceAdded can retry.
-                                    None => { subscribed.remove(&address); }
-                                }
-                            }
+                            subscriptions.try_subscribe(&adapter, address).await;
                         }
-                        Some(AdapterEvent::DeviceRemoved(address)) => { subscribed.remove(&address); }
+                        Some(AdapterEvent::DeviceRemoved(address)) => subscriptions.forget(address),
                         Some(AdapterEvent::PropertyChanged(_)) => {}
                         None => {
                             // bluer ends this stream on Discovering=false, which
@@ -167,7 +131,7 @@ fn scan_stream(
                     }
                 }
 
-                Some(event) = device_events.next(), if !device_events.is_empty() => {
+                Some(event) = subscriptions.next_event(), if subscriptions.has_any() => {
                     if let Some(advertisement) = to_advertisement(event) {
                         yield ScanEvent::Advertisement(advertisement);
                     }
@@ -177,51 +141,102 @@ fn scan_stream(
     }
 }
 
-/// Stops and restarts discovery, keeping the adapter's filter.
+/// Per-device subscriptions, fanned out in-process from the session's single
+/// PropertiesChanged match rule: no D-Bus round trip per device, and none per
+/// advertisement.
+///
+/// Grows with every distinct BLE device seen. The scan restart bounds it as a
+/// side effect, by clearing it; if that restart is ever retired, this needs an
+/// explicit cap or a prune of devices that have produced no Keiser data.
+#[derive(Default)]
+struct DeviceSubscriptions {
+    events: SelectAll<BoxStream<'static, AddressedDeviceEvent>>,
+    subscribed: HashSet<Address>,
+}
+
+impl DeviceSubscriptions {
+    /// Subscribes to one device's property changes, once. A failed
+    /// subscription is forgotten so a later DeviceAdded can retry.
+    ///
+    /// Deliberately does *not* read `device.manufacturer_data()`. That returns
+    /// BlueZ's cached payload, which would then be stamped as freshly
+    /// received. The cost of not doing it is one missed advertisement (~2 s)
+    /// per device appearance, well inside the 20 s staleness window.
+    async fn try_subscribe(&mut self, adapter: &Adapter, address: Address) {
+        if !self.subscribed.insert(address) {
+            return;
+        }
+        let events = adapter
+            .device(address)
+            .inspect_err(|e| tracing::debug!("Cannot open device {address}: {e}"))
+            .ok()
+            .map(|device| async move { device.events().await });
+        let events = match events {
+            Some(events) => events
+                .await
+                .inspect_err(|e| tracing::debug!("Cannot subscribe to {address}: {e}"))
+                .ok(),
+            None => None,
+        };
+        match events {
+            Some(events) => self
+                .events
+                .push(events.map(move |event| (address, event)).boxed()),
+            None => {
+                self.subscribed.remove(&address);
+            }
+        }
+    }
+
+    fn forget(&mut self, address: Address) {
+        self.subscribed.remove(&address);
+    }
+
+    fn has_any(&self) -> bool {
+        !self.events.is_empty()
+    }
+
+    async fn next_event(&mut self) -> Option<AddressedDeviceEvent> {
+        self.events.next().await
+    }
+
+    /// StopDiscovery makes BlueZ delete every temporary, non-connectable
+    /// device — and the M3i is one, it sends ADV_NONCONN_IND — so every
+    /// per-device subscription dies with a restart, and the DeviceRemoved
+    /// signals arrive while no adapter stream is held to observe them. Forget
+    /// all of it and let the fresh discovery re-announce whatever still
+    /// exists; keeping the set would leave the bridge permanently silent
+    /// after the first restart.
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Stops and restarts discovery, keeping the adapter's filter, and forgets
+/// every subscription the stop invalidated.
 ///
 /// Replacing the stream is what stops it: dropping bluer's discovery stream
 /// drops the session token, whose spawned task issues StopDiscovery. The settle
 /// delay gives that a chance to land before a new discovery is requested.
-async fn restart_discovery(
+async fn restart_scan(
     adapter: &Adapter,
     discovery: &mut DiscoveryStream,
+    subscriptions: &mut DeviceSubscriptions,
 ) -> Result<(), BoxError> {
+    subscriptions.clear();
     *discovery = Box::pin(futures_util::stream::empty());
     tokio::time::sleep(SCAN_SETTLE_DELAY).await;
     *discovery = Box::pin(adapter.discover_devices().await?);
     Ok(())
 }
 
-/// Subscribes to one device's property changes.
-///
-/// Deliberately does *not* read `device.manufacturer_data()` here. That returns
-/// BlueZ's cached payload, which the parser would then stamp as freshly
-/// received — the staleness bug of issue #5, in bluer form. The cost of not
-/// doing it is one missed advertisement (~2 s) per device appearance, well
-/// inside the 20 s staleness window.
-async fn subscribe(
-    adapter: &Adapter,
-    address: Address,
-) -> Option<BoxStream<'static, AddressedDeviceEvent>> {
-    let device = adapter
-        .device(address)
-        .inspect_err(|e| tracing::debug!("Cannot open device {address}: {e}"))
-        .ok()?;
-    let events = device
-        .events()
-        .await
-        .inspect_err(|e| tracing::debug!("Cannot subscribe to {address}: {e}"))
-        .ok()?;
-    Some(events.map(move |event| (address, event)).boxed())
-}
-
 /// Maps one device event to an advertisement, if it carries one.
 ///
 /// Pure, so the mapping is unit-tested without a D-Bus connection.
-fn to_advertisement((address, event): AddressedDeviceEvent) -> Option<Advertisement> {
+fn to_advertisement((address, event): AddressedDeviceEvent) -> Option<ReceivedAdvertisement> {
     match event {
         DeviceEvent::PropertyChanged(DeviceProperty::ManufacturerData(manufacturer_data)) => {
-            Some(Advertisement {
+            Some(ReceivedAdvertisement {
                 device: address.to_string(),
                 manufacturer_data,
             })

@@ -19,7 +19,8 @@
 mod advertising;
 mod between_retries_strategy;
 mod ble_platform;
-mod bluetooth_hal;
+mod ble_scanner;
+mod bridge;
 mod config;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod gatt_codec;
@@ -27,7 +28,6 @@ mod gatt_codec;
 mod gatt_server;
 mod keiser;
 mod mqtt;
-mod run_status;
 #[cfg(target_os = "linux")]
 mod scan_bluer;
 #[cfg(not(target_os = "linux"))]
@@ -36,8 +36,7 @@ mod stats;
 
 use between_retries_strategy::{BetweenRetriesResult, BetweenRetriesStrategy, ExponentialBackoff};
 use ble_platform::BlePlatform;
-use bluetooth_hal::run_bridge;
-use run_status::RunStatus;
+use bridge::{RunStatus, run_bridge};
 use std::future::Future;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;

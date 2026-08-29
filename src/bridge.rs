@@ -1,56 +1,24 @@
-//! Platform-independent half of the Bluetooth reader.
-//!
-//! Scanning itself is platform-specific — bluer on Linux, btleplug elsewhere —
-//! but everything above the raw advertisement lives here, so it is written once
-//! and tested on every platform.
+//! The bridge proper: reads advertisements from a scanner, decodes the Keiser
+//! ones, and records them in the fleet. Platform-independent, so it is
+//! written once and tested everywhere.
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
+use std::sync::Arc;
 
-use futures_util::stream::{Stream, StreamExt};
+use futures_util::stream::StreamExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::BoxError;
+use crate::ble_scanner::{BleScanner, ReceivedAdvertisement, ScanEvent, is_sampled_for_trace};
 use crate::keiser::{self, MANUFACTURER_ID};
-use crate::run_status::RunStatus;
 use crate::stats::{BikeId, Fleet, KeiserStats, Reading, record_reading};
-use std::sync::Arc;
 
-/// One received advertisement, reduced to the only part this bridge reads.
-#[derive(Debug, Clone)]
-pub struct Advertisement {
-    /// Address or id of the sender. For logging only — nothing branches on it.
-    pub device: String,
-    pub manufacturer_data: HashMap<u16, Vec<u8>>,
-}
-
-#[derive(Debug)]
-pub enum ScanEvent {
-    Advertisement(Advertisement),
-    /// The scan cannot continue. The caller tears down and `bridge_loop`
-    /// decides whether to retry.
-    Error(BoxError),
-}
-
-pub type ScanStream = Pin<Box<dyn Stream<Item = ScanEvent> + Send>>;
-
-/// Something that yields BLE advertisements.
-///
-/// The boundary is deliberately *raw manufacturer data* rather than parsed
-/// `KeiserStats`. Pushing the Keiser id match, the parse, the bike-id filter
-/// and the logging down into the platform implementations would duplicate the
-/// only interesting logic in the crate across a `cfg` split that CI can compile
-/// just one half of. Kept here, all of it is covered by tests that run
-/// everywhere.
-pub trait BleScanner {
-    /// Written as a desugared RPITIT rather than `async fn` so the `Send` bound
-    /// on the returned future is explicit.
-    fn scan(
-        &self,
-        cancel_token: CancellationToken,
-    ) -> impl Future<Output = Result<ScanStream, BoxError>> + Send;
+/// How one bridge attempt ended, for `bridge_loop` to decide what next.
+#[derive(Debug, PartialEq)]
+pub enum RunStatus {
+    Cancelled,
+    StreamEnded,
 }
 
 /// Reads advertisements until the scan ends, publishing each Keiser reading.
@@ -67,7 +35,7 @@ pub async fn run_bridge<S: BleScanner>(
         match event {
             ScanEvent::Advertisement(advertisement) => {
                 advertisement_count += 1;
-                if advertisement_count.is_multiple_of(100) || advertisement_count < 10 {
+                if is_sampled_for_trace(advertisement_count) {
                     tracing::trace!(
                         "Received advertisement {}: {:?}",
                         advertisement_count,
@@ -99,7 +67,7 @@ pub async fn run_bridge<S: BleScanner>(
 /// advertisement from bytes replayed out of a cache, so this must only ever
 /// be fed freshly received data.
 fn handle_advertisement(
-    advertisement: &Advertisement,
+    advertisement: &ReceivedAdvertisement,
     fleet_tx: &watch::Sender<Arc<Fleet>>,
     bike_id_filter: Option<BikeId>,
 ) {
@@ -168,8 +136,10 @@ fn log_bike_update(device: &str, stats: &KeiserStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ble_scanner::ScanStream;
     use crate::stats::Tenths;
     use hex_literal::hex;
+    use std::future::Future;
 
     /// A real live-data capture from `doc/sample-data.md`, bike id 0.
     const LIVE_CAPTURE: [u8; 17] = hex!("0624000034030000340002000100028008");
@@ -178,8 +148,8 @@ mod tests {
         HashMap::from([(manufacturer_id, data.to_vec())])
     }
 
-    fn advertisement(manufacturer_id: u16, data: &[u8]) -> Advertisement {
-        Advertisement {
+    fn advertisement(manufacturer_id: u16, data: &[u8]) -> ReceivedAdvertisement {
+        ReceivedAdvertisement {
             device: "00:11:22:33:44:55".to_string(),
             manufacturer_data: manufacturer_data(manufacturer_id, data),
         }
