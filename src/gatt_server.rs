@@ -420,6 +420,7 @@ mod linux_impl {
         session: bluer::Session,
         cancel_token: tokio_util::sync::CancellationToken,
         stats_rx: watch::Receiver<Arc<Fleet>>,
+        locked_to: Option<BikeId>,
     ) -> Result<(), BoxError> {
         tracing::info!("Initializing BLE GATT server via bluer...");
 
@@ -447,8 +448,14 @@ mod linux_impl {
             adapter: adapter.clone(),
             current: None,
         };
-        let result =
-            track_advertised_bike(&mut advertiser, stats_rx, &advertised_tx, cancel_token).await;
+        let result = track_advertised_bike(
+            &mut advertiser,
+            stats_rx,
+            &advertised_tx,
+            cancel_token,
+            locked_to,
+        )
+        .await;
 
         tracing::info!("Shutting down BLE GATT server...");
         drop(app_handle);
@@ -506,6 +513,7 @@ pub use linux_impl::run;
 pub async fn run(
     cancel_token: tokio_util::sync::CancellationToken,
     _stats_rx: tokio::sync::watch::Receiver<std::sync::Arc<crate::stats::Fleet>>,
+    _locked_to: Option<crate::stats::BikeId>,
 ) -> Result<(), crate::BoxError> {
     tracing::warn!(
         "BLE GATT server broadcasting is only supported on Linux (BlueZ). \

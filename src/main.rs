@@ -79,22 +79,30 @@ async fn main() -> Result<(), BoxError> {
         }
     };
 
+    // Read once at startup rather than per advertisement: this is on the hot
+    // path, at roughly 2 Hz per bike in range.
+    let bike_id_filter = config::bike_id_filter(|key| std::env::var(key).ok());
+    match bike_id_filter {
+        Some(bike_id) => tracing::info!(
+            "Locked to bike {bike_id}: only its readings are published, and the bridge advertises as it from the start"
+        ),
+        None => tracing::info!(
+            "Accepting any Keiser M3i in range: one Home Assistant device per bike heard, and the advertisement follows the bike being ridden"
+        ),
+    }
+
     let gatt_platform = platform.clone();
     let gatt_cancel_token = cancel_token.clone();
     let gatt_handle = supervisor::spawn(
         "GATT server",
         OnFailure::CancelEverything,
         cancel_token.clone(),
-        async move { gatt_platform.serve_gatt(gatt_cancel_token, stats_rx).await },
+        async move {
+            gatt_platform
+                .serve_gatt(gatt_cancel_token, stats_rx, bike_id_filter)
+                .await
+        },
     );
-
-    // Read once at startup rather than per advertisement: this is on the hot
-    // path, at roughly 2 Hz per bike in range.
-    let bike_id_filter = config::bike_id_filter(|key| std::env::var(key).ok());
-    match bike_id_filter {
-        Some(bike_id) => tracing::info!("Only accepting advertisements from bike {}", bike_id),
-        None => tracing::info!("Accepting advertisements from any Keiser M3i in range"),
-    }
 
     let retry = Backoff::new(RETRY_DURATION, MAX_RETRY_DURATION, HEALTHY_RUN_DURATION);
     let run_bridge_wrapper = move |token: CancellationToken| {

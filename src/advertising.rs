@@ -221,12 +221,31 @@ pub trait Advertiser {
 /// succeeds, so the DIS serial number and the notify loops never name a bike
 /// that is not on the air. A registration that fails even via the fallback
 /// is returned as an error: it does not heal in-process.
+///
+/// With `locked_to` set, this bridge instance is dedicated to one bike (the
+/// one-bridge-per-bike studio setup): that name goes on the air immediately,
+/// so a rider pairing before pedalling finds the trainer, and nothing ever
+/// changes it.
 pub async fn track_advertised_bike<A: Advertiser>(
     advertiser: &mut A,
     mut fleet_rx: watch::Receiver<Arc<Fleet>>,
     advertised: &watch::Sender<Option<BikeId>>,
     cancel_token: CancellationToken,
+    locked_to: Option<BikeId>,
 ) -> Result<(), BoxError> {
+    if let Some(bike_id) = locked_to {
+        let name = bike_id.display_name();
+        tracing::info!("Locked to bike {bike_id}: advertising as {name:?} from the start");
+        let result = advertiser.advertise(&name).await;
+        if result.is_ok() {
+            let _ = advertised.send(Some(bike_id));
+            tracing::info!("BLE broadcasting active as {:?}", name);
+            cancel_token.cancelled().await;
+        }
+        advertiser.stop().await;
+        return result;
+    }
+
     let mut tracker = AdvertisedIdTracker::default();
     let mut arrivals = NewArrivals::default();
 
@@ -561,6 +580,10 @@ mod tests {
 
     impl Harness {
         fn start() -> Self {
+            Self::start_with(None)
+        }
+
+        fn start_with(locked_to: Option<BikeId>) -> Self {
             let advertiser = FakeAdvertiser::default();
             let (fleet_tx, fleet_rx) = fleet_channel();
             let (advertised_tx, advertised_rx) = watch::channel(None);
@@ -568,8 +591,14 @@ mod tests {
             let mut loop_advertiser = advertiser.clone();
             let loop_cancel = cancel.clone();
             let task = tokio::spawn(async move {
-                track_advertised_bike(&mut loop_advertiser, fleet_rx, &advertised_tx, loop_cancel)
-                    .await
+                track_advertised_bike(
+                    &mut loop_advertiser,
+                    fleet_rx,
+                    &advertised_tx,
+                    loop_cancel,
+                    locked_to,
+                )
+                .await
             });
             Self {
                 advertiser,
@@ -672,6 +701,40 @@ mod tests {
         );
         let result = harness.task.await.unwrap();
         assert!(result.is_err(), "fail fast: the process restarts");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_locked_bike_when_the_loop_starts_then_it_advertises_before_any_packet() {
+        // The dedicated-bridge case: the name is known from configuration, so
+        // a rider pairing before pedalling must already find the trainer.
+        let harness = Harness::start_with(Some(BikeId(42)));
+        harness.advance(1).await;
+        assert_eq!(harness.advertiser.events(), ["advertise Keiser M3i #042"]);
+        assert_eq!(*harness.advertised_rx.borrow(), Some(BikeId(42)));
+        harness.finish().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_locked_bike_when_another_bike_is_ridden_for_the_hold_then_nothing_switches() {
+        // The reader's filter already drops other bikes; this pins that even a
+        // reading that got through could not move the advertisement.
+        let harness = Harness::start_with(Some(BikeId(1)));
+        for _ in 0..6 {
+            harness.hear(2).await;
+            harness.advance(2).await;
+        }
+        assert_eq!(harness.advertiser.events(), ["advertise Keiser M3i #001"]);
+        assert_eq!(*harness.advertised_rx.borrow(), Some(BikeId(1)));
+        harness.finish().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_locked_bike_when_its_registration_fails_then_the_loop_fails_at_once() {
+        let harness = Harness::start_with(Some(BikeId(1)));
+        *harness.advertiser.fail_next.lock().unwrap() = true;
+        harness.advance(1).await;
+        assert_eq!(*harness.advertised_rx.borrow(), None);
+        assert!(harness.task.await.unwrap().is_err());
     }
 
     #[tokio::test(start_paused = true)]
