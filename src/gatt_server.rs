@@ -556,8 +556,16 @@ mod linux_impl {
         if output.status.success() {
             Ok(())
         } else {
-            let err = String::from_utf8_lossy(&output.stderr).into_owned();
-            Err(format!("btmgmt failed: {err}").into())
+            // btmgmt reports its failures on stdout, not stderr.
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!(
+                "btmgmt {} failed: {}{}",
+                args.join(" "),
+                stdout.trim(),
+                stderr.trim()
+            )
+            .into())
         }
     }
 
