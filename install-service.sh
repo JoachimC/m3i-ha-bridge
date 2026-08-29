@@ -26,6 +26,10 @@ sudo tee "$ENV_FILE" > /dev/null <<EOF
 # every other Keiser bike in range. Unset means accept any bike.
 #KEISER_BIKE_ID=0
 #
+# Log level. RUST_LOG=info,bike_stats=trace additionally logs every parsed
+# bike reading while keeping the rest of the bridge quiet.
+#RUST_LOG=info
+#
 # The broker password does NOT belong in this file. Environment variables are
 # readable through /proc/<pid>/environ and are inherited by every child process,
 # and this service execs btmgmt. Store it as a systemd credential instead:

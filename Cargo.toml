@@ -19,17 +19,16 @@ rust-version = "1.88"
 
 [dependencies]
 # Only what the crate actually uses, rather than `full`. `rt` covers the
-# current-thread runtime and `tokio::spawn`; `process` is the btmgmt fallback in
-# gatt_server; `net` and `io-util` are needed by rumqttc and the D-Bus stack.
-# `full` additionally pulls in `fs`, `io-std` and `rt-multi-thread`, none of
-# which are reachable from this binary.
+# current-thread runtime and `tokio::spawn`; `net` and `io-util` are what
+# rumqttc and the D-Bus stack build on. `full` additionally pulls in `fs`,
+# `io-std` and `rt-multi-thread`, none of which are reachable from this
+# binary. `process` is Linux-only, below.
 tokio = { version = "1", features = [
     "rt",
     "macros",
     "time",
     "sync",
     "signal",
-    "process",
     "net",
     "io-util",
 ] }
@@ -54,8 +53,9 @@ hex-literal = "1.1.0"
 # rumqttc's request channel, so tests can stand in for the event loop via
 # AsyncClient::from_senders and inspect what a publish actually queued.
 flume = { version = "0.11", default-features = false }
-# Make sure test-util is present so start_paused can be parsed!
-tokio = { version = "1.0", features = ["rt", "macros", "test-util"] }
+# `test-util` is what `#[tokio::test(start_paused = true)]` needs; the rest of
+# the feature set comes from the main dependency.
+tokio = { version = "1", features = ["test-util"] }
 
 # btleplug is the scanner everywhere except Linux, which uses bluer instead.
 # Target-gating it keeps it out of the Pi binary entirely, taking futures, uuid,
@@ -73,6 +73,8 @@ uuid = "1"
 # a static binary cannot use.
 libdbus-sys = { version = "0.2", features = ["vendored"] }
 bluer = { version = "0.17", features = ["bluetoothd"] }
+# `process` is only for the btmgmt fallback in gatt_server, which is Linux-only.
+tokio = { version = "1", features = ["process"] }
 
 [profile.release]
 # Every knob here was measured on the real deploy target
