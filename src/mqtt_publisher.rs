@@ -241,6 +241,22 @@ impl BikePublisher {
         }
     }
 
+    /// Forgets what has been published, so the next tick re-sends every bike's
+    /// availability and state.
+    ///
+    /// Called on every (re)connect. The broker may have lost its retained
+    /// messages (a restart without persistence, a migration), and the driver
+    /// re-announces discovery and the bridge availability but knows nothing
+    /// about per-bike liveness; without this, a bike's `online` — published
+    /// only on a transition — would stay missing until the bike happened to
+    /// go stale and come back, leaving all its entities unavailable.
+    fn reconnected(&mut self) {
+        for bike in self.bikes.values_mut() {
+            bike.published_online = None;
+            bike.gate = PublishGate::new(HEARTBEAT_INTERVAL);
+        }
+    }
+
     /// The retained `offline` for every bike, sent ahead of the bridge's own
     /// so a Home Assistant that comes back later sees each device as gone.
     fn offline_messages(&self) -> Vec<OutgoingMessage> {
@@ -418,6 +434,9 @@ pub async fn run(
     let (client, eventloop) = AsyncClient::new(options, REQUEST_CHANNEL_CAPACITY);
 
     let known_bikes = Arc::new(Mutex::new(BTreeSet::new()));
+    // Bumped by the driver on every ConnAck, so the state loop can re-send
+    // what the broker may have lost.
+    let (connected_tx, mut connected_rx) = watch::channel(0u64);
 
     // The connection driver is the sole poller of the event loop, which is also
     // what performs reconnects. Nothing else can drive the connection, so it
@@ -428,6 +447,7 @@ pub async fn run(
         client.clone(),
         config.clone(),
         known_bikes.clone(),
+        connected_tx,
         cancel_token.clone(),
     ));
 
@@ -448,6 +468,10 @@ pub async fn run(
             break;
         };
 
+        if connected_rx.has_changed().unwrap_or(false) {
+            connected_rx.borrow_and_update();
+            publisher.reconnected();
+        }
         for message in publisher.observe(stats) {
             try_send(&client, &message);
         }
@@ -521,6 +545,7 @@ async fn drive_connection(
     client: AsyncClient,
     config: MqttConfig,
     known_bikes: Arc<Mutex<BTreeSet<u8>>>,
+    connected: watch::Sender<u64>,
     cancel_token: CancellationToken,
 ) {
     let mut driver_queued = 0;
@@ -531,6 +556,7 @@ async fn drive_connection(
                 tracing::info!("Connected to MQTT broker");
                 let bikes = known_bikes.lock().unwrap().clone();
                 driver_queued = announce(&client, &config, &bikes);
+                connected.send_modify(|generation| *generation += 1);
             }
             // A non-zero packet id means a QoS 1 publish reached the socket;
             // the QoS 0 state publishes always report packet id 0.
@@ -1505,6 +1531,36 @@ mod tests {
 
         let sent = tick_all(&mut publisher);
         assert_eq!(sent.len(), 2, "availability and state both retried");
+    }
+
+    #[test]
+    fn given_a_reconnect_when_ticked_then_every_bikes_availability_and_state_are_resent() {
+        // The broker may have lost its retained messages while the bridge was
+        // away; a bike's `online` is only ever sent on a transition, so a
+        // reconnect has to forget what was published.
+        let mut publisher = publisher();
+        publisher.observe(reading_from(1, 100));
+        publisher.observe(reading_from(2, 200));
+        tick_all(&mut publisher);
+        assert!(tick_all(&mut publisher).is_empty(), "steady state");
+
+        publisher.reconnected();
+        let sent = tick_all(&mut publisher);
+
+        let topics: Vec<&str> = sent.iter().map(|m| m.topic.as_str()).collect();
+        assert_eq!(
+            topics,
+            [
+                "m3i/001/availability",
+                "m3i/001/state",
+                "m3i/002/availability",
+                "m3i/002/state",
+            ]
+        );
+        assert!(
+            sent.iter()
+                .all(|m| !m.topic.ends_with("availability") || m.payload == "online")
+        );
     }
 
     #[test]
