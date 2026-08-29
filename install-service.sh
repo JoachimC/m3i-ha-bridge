@@ -22,8 +22,10 @@ if [ ! -f "$ENV_FILE" ]; then
 sudo tee "$ENV_FILE" > /dev/null <<EOF
 # Keiser M3i HA Bridge configuration
 #
-# Set KEISER_BIKE_ID to the ordinal id shown on the bike's console to ignore
-# every other Keiser bike in range. Unset means accept any bike.
+# Unset: accept any Keiser bike in range (one Home Assistant device per bike,
+# the BLE name follows the bike being ridden). Set to the ordinal id shown on
+# the bike's console to dedicate this bridge to that one bike: only it is
+# published, and the bridge advertises as it from startup.
 #KEISER_BIKE_ID=0
 #
 # Log level. RUST_LOG=info,bike_stats=trace additionally logs every parsed

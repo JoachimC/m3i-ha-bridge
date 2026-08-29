@@ -128,11 +128,15 @@ Because the GATT server is `cfg(target_os = "linux")`, it never compiles on a Ma
 
 ## Bike Selection
 
-By default the bridge accepts every Keiser M3i it hears. All M-Series bikes advertise under the same company id and packet format; each bike heard is tracked separately (see [Bike identity](#bike-identity)), and the filter below narrows the bridge to one of them.
+The bridge has two modes. All M-Series bikes advertise under the same company id and packet format, so the mode decides what happens when more than one is in range.
 
 | Variable | Default | Description |
 |---|---|---|
-| `KEISER_BIKE_ID` | *(unset — accept any bike)* | Ordinal id (0–200) configured on the bike, as shown in its console. Advertisements from any other bike are ignored. Note `0` is a valid id, so setting it does filter. |
+| `KEISER_BIKE_ID` | *(unset — any bike)* | Ordinal id (0–200) configured on the bike, as shown in its console. Note `0` is a valid id, so setting it does select. |
+
+**Any bike** (`KEISER_BIKE_ID` unset) — the mode for a home with one bike and nothing to configure. Every bike heard becomes its own Home Assistant device, and the BLE advertisement follows the bike being ridden (see [Bike identity](#bike-identity)).
+
+**Single bike** (`KEISER_BIKE_ID` set) — the mode for a studio, one bridge per bike. Only that bike's readings are published, so it is the only Home Assistant device this bridge creates; the bridge advertises as that bike **from the moment it starts**, before any packet, so a rider who pairs first and pedals second finds the trainer; and the advertisement never changes, however many other bikes are in range. Set it in `/etc/default/m3i-ha-bridge` and restart the service.
 
 ### Bike identity
 

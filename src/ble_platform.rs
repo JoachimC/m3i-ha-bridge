@@ -7,7 +7,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::BoxError;
-use crate::stats::Fleet;
+use crate::stats::{BikeId, Fleet};
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
@@ -59,8 +59,9 @@ impl BlePlatform {
         &self,
         cancel_token: CancellationToken,
         stats_rx: watch::Receiver<Arc<Fleet>>,
+        locked_to: Option<BikeId>,
     ) -> Result<(), BoxError> {
-        crate::gatt_server::run(self.session.clone(), cancel_token, stats_rx).await
+        crate::gatt_server::run(self.session.clone(), cancel_token, stats_rx, locked_to).await
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -68,7 +69,8 @@ impl BlePlatform {
         &self,
         cancel_token: CancellationToken,
         stats_rx: watch::Receiver<Arc<Fleet>>,
+        locked_to: Option<BikeId>,
     ) -> Result<(), BoxError> {
-        crate::gatt_server::run(cancel_token, stats_rx).await
+        crate::gatt_server::run(cancel_token, stats_rx, locked_to).await
     }
 }
