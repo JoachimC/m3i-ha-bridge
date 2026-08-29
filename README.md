@@ -323,6 +323,8 @@ Do these steps on your development machine.
 
 The service uses the file `m3i-ha-bridge-static` in the home directory of the ssh user. This is where `deploy.sh` put it. If the binary is in a different directory, set `INSTALL_DIR` when you run the script.
 
+Run the script again after you upgrade the bridge. It rewrites the unit file, so changes to the unit arrive with the new binary. It does not change `/etc/default/m3i-ha-bridge` if the file exists.
+
 ---
 
 ## Managing the Service

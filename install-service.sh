@@ -102,6 +102,12 @@ EnvironmentFile=-$ENV_FILE
 # root-only directory exported as \$CREDENTIALS_DIRECTORY, so it never appears
 # in /proc/<pid>/environ and is not inherited by btmgmt.
 $LOAD_CREDENTIAL
+# SIGTERM goes to the bridge only. The default (control-group) also signals
+# the btmgmt the bridge runs during its own shutdown to remove the
+# advertisement, killing it about half the time and leaving the advertising
+# instance registered. Anything still running after the bridge exits is
+# SIGKILLed as before.
+KillMode=mixed
 Restart=always
 RestartSec=5
 User=root
