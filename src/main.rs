@@ -144,7 +144,7 @@ async fn main() -> Result<(), BoxError> {
 
     // The bluetooth reader is the single producer on this watch channel; each
     // publisher (BLE GATT, MQTT) consumes its own receiver independently.
-    let (stats_tx, stats_rx) = tokio::sync::watch::channel(stats::KeiserStats::default());
+    let (stats_tx, stats_rx) = stats::fleet_channel();
 
     let mqtt_handle = match mqtt_publisher::MqttConfig::from_env() {
         Some(config) => {
@@ -435,7 +435,7 @@ mod tests {
         // moves its only sender into the wrapper, and bridge_loop takes the
         // wrapper by value. Holding a sender in main would keep the channel
         // open forever and turn those branches into dead code.
-        let (stats_tx, mut stats_rx) = tokio::sync::watch::channel(stats::KeiserStats::default());
+        let (stats_tx, mut stats_rx) = stats::fleet_channel();
         let cancel_token = CancellationToken::new();
         let token_clone = cancel_token.clone();
         let wrapper = move |_token: CancellationToken| {

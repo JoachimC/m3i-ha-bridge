@@ -6,11 +6,12 @@
 //! unit-tested on every platform, even though the GATT server itself only
 //! runs on Linux.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::stats::{KeiserStats, bike_display_name, bike_id_label};
+use crate::stats::{Fleet, KeiserStats, Reading, bike_display_name, bike_id_label};
 
 /// Name the bridge advertises itself under: the bike's display name, so a
 /// pairing screen in Zwift or Garmin shows which bike this is.
@@ -102,48 +103,28 @@ impl AdvertisedIdTracker {
 /// Lets only readings that actually arrived through to the advertising
 /// tracker.
 ///
-/// The watch channel re-delivers its current value on every poll timeout so
+/// The watch channel re-delivers its current snapshot on every poll timeout so
 /// consumers can watch a reading go stale. For the tracker that is poison: a
 /// single packet from a neighbouring bike, re-delivered once a second while
 /// the advertised bike's rider coasts, would look like that bike being
-/// present for the whole hold and steal the advertisement. A reading counts
-/// as a sighting only when its receive timestamp differs from the last one.
+/// present for the whole hold and steal the advertisement. A bike counts as
+/// sighted only when its reading's receive timestamp has changed.
 #[derive(Debug, Default)]
 pub struct NewArrivals {
-    last_seen: Option<std::time::Instant>,
+    seen: BTreeMap<u8, std::time::Instant>,
 }
 
 impl NewArrivals {
-    /// The bike id of `stats` if this is a reading not seen before.
-    pub fn bike_id_if_new(&mut self, stats: &KeiserStats) -> Option<u8> {
-        let bike_id = stats.bike_id()?;
-        if stats.last_updated == self.last_seen {
-            return None;
-        }
-        self.last_seen = stats.last_updated;
-        Some(bike_id)
+    /// The bikes whose reading in `fleet` has not been seen before.
+    pub fn new_in(&mut self, fleet: &Fleet) -> Vec<u8> {
+        fleet
+            .iter()
+            .filter(|(bike_id, reading)| {
+                self.seen.insert(**bike_id, reading.received_at) != Some(reading.received_at)
+            })
+            .map(|(bike_id, _)| *bike_id)
+            .collect()
     }
-}
-
-/// Picks the reading a notify loop should send: the one from the bike the
-/// advertisement names, or nothing.
-///
-/// The watch channel carries every bike in range, so in a multi-bike room a
-/// client paired to "Keiser M3i #042" would otherwise be notified with #007's
-/// power interleaved. A reading from another bike neither goes out nor
-/// replaces `kept`; the advertised bike's last reading is re-sent instead, so
-/// it still decays to zero on staleness rather than freezing at its last live
-/// value while another bike holds the channel.
-pub fn reading_for_advertised_bike(
-    kept: Option<KeiserStats>,
-    incoming: KeiserStats,
-    advertised: Option<u8>,
-) -> Option<KeiserStats> {
-    let advertised = advertised?;
-    if incoming.bike_id() == Some(advertised) {
-        return Some(incoming);
-    }
-    kept.filter(|kept| kept.bike_id() == Some(advertised))
 }
 
 /// A legacy (non-extended) BLE advertising packet carries at most 31 bytes of
@@ -266,11 +247,11 @@ pub fn serialize_hrs(stats: &KeiserStats) -> Vec<u8> {
 /// `serialize` is therefore only invoked when something is actually being sent,
 /// which keeps the stateful CPS serializer from advancing on a skipped send.
 pub fn initial_notification(
-    stats: &KeiserStats,
+    reading: &Reading,
     has_value: fn(&KeiserStats) -> bool,
     serialize: &mut impl FnMut(&KeiserStats) -> Vec<u8>,
 ) -> Option<Vec<u8>> {
-    let stats = stats.clone().sanitized();
+    let stats = reading.sanitized();
     has_value(&stats).then(|| serialize(&stats))
 }
 
@@ -320,9 +301,12 @@ mod tests {
             gear: 12,
             minutes: 2,
             seconds: 5,
-            last_updated: Some(std::time::Instant::now()),
             ..Default::default()
         }
+    }
+
+    fn reading() -> Reading {
+        Reading::now(stats())
     }
 
     fn le_u16(data: &[u8], offset: usize) -> u16 {
@@ -372,86 +356,53 @@ mod tests {
         assert!(legacy_advertising_size(&local_name(200), 4) <= LEGACY_ADVERTISING_CAPACITY);
     }
 
-    fn reading_from(bike_id: u8, power: u16) -> KeiserStats {
-        KeiserStats {
+    fn reading_from(bike_id: u8, power: u16) -> Reading {
+        Reading::now(KeiserStats {
             bike_id,
             power,
             ..stats()
-        }
+        })
+    }
+
+    fn fleet_of(readings: impl IntoIterator<Item = Reading>) -> Fleet {
+        readings
+            .into_iter()
+            .map(|reading| (reading.stats.bike_id, reading))
+            .collect()
     }
 
     #[test]
-    fn given_nothing_advertised_when_a_reading_arrives_then_nothing_is_sent() {
-        // No advertisement means no client can have paired to a named bike,
-        // so there is no bike whose data it would be correct to send.
-        assert!(reading_for_advertised_bike(None, reading_from(1, 100), None).is_none());
-    }
-
-    #[test]
-    fn given_the_advertised_bikes_reading_when_it_arrives_then_it_is_sent() {
-        let sent = reading_for_advertised_bike(None, reading_from(42, 150), Some(42)).unwrap();
-        assert_eq!(sent.power, 150);
-    }
-
-    #[test]
-    fn given_another_bikes_reading_when_it_arrives_then_the_advertised_bikes_last_is_resent() {
-        // The multi-bike room: a client paired to #042 must never see #007's
-        // power, and must keep seeing #042's last reading so the staleness
-        // clock (its own last_updated) can zero it in due course.
-        let kept = Some(reading_from(42, 150));
-        let sent = reading_for_advertised_bike(kept, reading_from(7, 999), Some(42)).unwrap();
-        assert_eq!(sent.bike_id, 42);
-        assert_eq!(sent.power, 150);
-    }
-
-    #[test]
-    fn given_another_bikes_reading_and_nothing_kept_when_it_arrives_then_nothing_is_sent() {
-        assert!(reading_for_advertised_bike(None, reading_from(7, 999), Some(42)).is_none());
-    }
-
-    #[test]
-    fn given_the_advertisement_switched_bikes_when_the_old_bikes_reading_is_kept_then_it_is_dropped()
-     {
-        // After the advertisement moves to #007, #042's remembered reading is
-        // the wrong bike too — a #007 client must not be fed #042's tail.
-        let kept = Some(reading_from(42, 150));
-        assert!(reading_for_advertised_bike(kept, reading_from(3, 50), Some(7)).is_none());
-    }
-
-    #[test]
-    fn given_the_initial_channel_value_when_it_arrives_then_it_is_not_mistaken_for_bike_zero() {
-        // The default reading has bike_id 0 but no timestamp; with #000
-        // advertised it still must not be sent as that bike's data.
-        assert!(reading_for_advertised_bike(None, KeiserStats::default(), Some(0)).is_none());
-    }
-
-    #[test]
-    fn given_the_channels_initial_value_when_filtered_then_it_is_not_a_sighting() {
+    fn given_an_empty_fleet_when_filtered_then_nothing_is_sighted() {
         let mut arrivals = NewArrivals::default();
-        assert_eq!(arrivals.bike_id_if_new(&KeiserStats::default()), None);
+        assert!(arrivals.new_in(&Fleet::new()).is_empty());
     }
 
     #[test]
-    fn given_a_reading_delivered_again_by_the_poll_when_filtered_then_it_counts_once() {
+    fn given_a_snapshot_delivered_again_by_the_poll_when_filtered_then_each_reading_counts_once() {
         // One stray packet from bike 7 re-delivered every second must not read
         // as bike 7 being present for ten seconds.
         let mut arrivals = NewArrivals::default();
-        let stray = reading_from(7, 50);
-        assert_eq!(arrivals.bike_id_if_new(&stray), Some(7));
-        assert_eq!(arrivals.bike_id_if_new(&stray), None);
-        assert_eq!(arrivals.bike_id_if_new(&stray), None);
+        let fleet = fleet_of([reading_from(7, 50)]);
+        assert_eq!(arrivals.new_in(&fleet), [7]);
+        assert!(arrivals.new_in(&fleet).is_empty());
+        assert!(arrivals.new_in(&fleet).is_empty());
     }
 
     #[test]
-    fn given_a_fresh_reading_when_filtered_then_it_is_a_sighting() {
+    fn given_a_fresh_reading_for_one_bike_when_filtered_then_only_that_bike_is_sighted() {
         let mut arrivals = NewArrivals::default();
-        let first = reading_from(42, 150);
-        let second = KeiserStats {
-            last_updated: Some(std::time::Instant::now() + Duration::from_secs(2)),
+        let bike_42 = reading_from(42, 150);
+        let bike_7 = reading_from(7, 50);
+        assert_eq!(
+            arrivals.new_in(&fleet_of([bike_42.clone(), bike_7.clone()])),
+            [7, 42]
+        );
+
+        let bike_42_again = Reading {
+            received_at: std::time::Instant::now() + Duration::from_secs(2),
             ..reading_from(42, 160)
         };
-        assert_eq!(arrivals.bike_id_if_new(&first), Some(42));
-        assert_eq!(arrivals.bike_id_if_new(&second), Some(42));
+        assert_eq!(arrivals.new_in(&fleet_of([bike_42_again, bike_7])), [42]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -459,16 +410,18 @@ mod tests {
      {
         // The end-to-end shape of the defect: bike 42 is advertised, its rider
         // stops pedalling, one packet from bike 7 arrives, and the channel
-        // re-delivers it once a second for longer than the hold.
+        // re-delivers the same snapshot once a second for longer than the hold.
         let mut arrivals = NewArrivals::default();
         let mut tracker = AdvertisedIdTracker::default();
         let bike_42 = reading_from(42, 150);
-        tracker.observe(arrivals.bike_id_if_new(&bike_42).unwrap(), Instant::now());
+        for id in arrivals.new_in(&fleet_of([bike_42.clone()])) {
+            tracker.observe(id, Instant::now());
+        }
         tracker.take_due(Instant::now());
 
-        let stray = reading_from(7, 50);
+        let fleet = fleet_of([bike_42, reading_from(7, 50)]);
         for _ in 0..15 {
-            if let Some(id) = arrivals.bike_id_if_new(&stray) {
+            for id in arrivals.new_in(&fleet) {
                 tracker.observe(id, Instant::now());
             }
             tokio::time::advance(Duration::from_secs(1)).await;
@@ -674,17 +627,17 @@ mod tests {
 
     /// The state a bridge sits in between rides: real values were received,
     /// but long enough ago that they must not be reported as current.
-    fn stale_stats() -> KeiserStats {
-        KeiserStats {
-            last_updated: None,
-            ..stats()
+    fn stale_reading() -> Reading {
+        Reading {
+            stats: stats(),
+            received_at: std::time::Instant::now() - crate::stats::STALE_AFTER * 2,
         }
     }
 
     #[test]
     fn given_live_stats_when_the_initial_notification_is_built_then_it_carries_them() {
         let mut serialize = serialize_ftms;
-        let payload = initial_notification(&stats(), ftms_has_value, &mut serialize)
+        let payload = initial_notification(&reading(), ftms_has_value, &mut serialize)
             .expect("live stats are worth sending");
         assert_eq!(le_u16(&payload, 11), 150, "power");
         assert_eq!(le_u16(&payload, 4), 170, "cadence in 0.5 RPM units");
@@ -697,15 +650,15 @@ mod tests {
         // to send, and a client subscribing an hour after a ride was handed the
         // last live power, cadence and heart rate.
         let mut serialize = serialize_ftms;
-        assert!(initial_notification(&stale_stats(), ftms_has_value, &mut serialize).is_none());
+        assert!(initial_notification(&stale_reading(), ftms_has_value, &mut serialize).is_none());
     }
 
     #[test]
     fn given_a_paused_bike_when_the_initial_notification_is_built_then_nothing_is_sent() {
-        let paused = KeiserStats {
+        let paused = Reading::now(KeiserStats {
             is_paused: true,
             ..stats()
-        };
+        });
         let mut serialize = serialize_ftms;
         assert!(initial_notification(&paused, ftms_has_value, &mut serialize).is_none());
     }
@@ -721,7 +674,7 @@ mod tests {
             calls += 1;
             serialize_cps(stats, 0, 0)
         };
-        assert!(initial_notification(&stale_stats(), cps_has_value, &mut serialize).is_none());
+        assert!(initial_notification(&stale_reading(), cps_has_value, &mut serialize).is_none());
         assert_eq!(calls, 0, "nothing to send means nothing to serialize");
     }
 
@@ -729,7 +682,7 @@ mod tests {
     fn given_stale_stats_when_any_characteristic_decides_then_none_reports_a_value() {
         // All three characteristics gate on a live metric, and `sanitized`
         // zeroes exactly those three, so staleness silences every one of them.
-        let stale = stale_stats().sanitized();
+        let stale = stale_reading().sanitized();
         assert!(!ftms_has_value(&stale), "Indoor Bike Data");
         assert!(!cps_has_value(&stale), "Cycling Power");
         assert!(!hrs_has_value(&stale), "Heart Rate");
@@ -737,7 +690,7 @@ mod tests {
 
     #[test]
     fn given_live_stats_when_each_characteristic_decides_then_all_report_a_value() {
-        let live = stats().sanitized();
+        let live = reading().sanitized();
         assert!(ftms_has_value(&live), "Indoor Bike Data");
         assert!(cps_has_value(&live), "Cycling Power");
         assert!(hrs_has_value(&live), "Heart Rate");

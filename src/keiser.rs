@@ -138,7 +138,6 @@ pub fn parse_keiser_data(data: &[u8]) -> Option<KeiserStats> {
         minutes: data[12],
         seconds: data[13],
         gear: data[16],
-        last_updated: Some(std::time::Instant::now()),
     })
 }
 
@@ -167,7 +166,6 @@ mod tests {
         assert_eq!(stats.seconds, 0x33);
         assert_eq!(stats.distance, 0.1);
         assert_eq!(stats.gear, 8);
-        assert!(stats.last_updated.is_some());
     }
 
     #[test]
