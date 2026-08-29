@@ -28,67 +28,79 @@ use crate::stats::{Sanitized, Tenths};
 /// never run on a macOS dev machine.
 pub const FTMS_FEATURE_VALUE: [u8; 8] = [0x86, 0x54, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 
-/// FTMS Indoor Bike Data (0x2AD2).
-///
-/// Flags 0x0A74: Cadence (bit 2), Total Distance (bit 4), Resistance (bit 5),
-/// Power (bit 6), Heart Rate (bit 9) and Elapsed Time (bit 11) present.
-/// Bit 0 ("More Data") clear means Instantaneous Speed is also present.
+/// Indoor Bike Data flags (FTMS v1.0 §4.9.1): Cadence (bit 2), Total Distance
+/// (bit 4), Resistance (bit 5), Power (bit 6), Heart Rate (bit 9) and Elapsed
+/// Time (bit 11) present. Bit 0 ("More Data") clear means Instantaneous Speed
+/// is also present.
+const INDOOR_BIKE_DATA_FLAGS: u16 = 0x0A74;
+
+/// Cycling Power Measurement flags (CPS v1.1 §3.2): Crank Revolution Data
+/// present. Instantaneous Power is always present.
+const CPS_MEASUREMENT_FLAGS: u16 = 0x0020;
+
+/// Heart Rate Measurement flags (HRS v1.0 §3.1): a `u8` value, no extra fields.
+const HRS_MEASUREMENT_FLAGS: u8 = 0x00;
+
+/// FTMS Indoor Bike Data (0x2AD2), fields in the order the flags declare.
 pub fn serialize_ftms(stats: &Sanitized) -> Vec<u8> {
-    let flags: u16 = 0x0A74;
     let mut data = Vec::with_capacity(16);
-    data.extend_from_slice(&flags.to_le_bytes());
-
-    // Instantaneous Speed: u16, 0.01 km/h
-    let speed_u16 = (calculate_speed_from_power(stats.power) * 100.0) as u16;
-    data.extend_from_slice(&speed_u16.to_le_bytes());
-
-    // Instantaneous Cadence: u16, 0.5 RPM
-    let cadence_half_rpm = stats.cadence.0 / 5;
-    data.extend_from_slice(&cadence_half_rpm.to_le_bytes());
-
-    // Total Distance: u24, meters (stats.distance is tenths of a km)
-    let distance_m = u32::from(stats.distance.0) * 100;
-    data.extend_from_slice(&distance_m.to_le_bytes()[0..3]);
-
-    // Resistance Level: i16 (the M3i's gear)
-    data.extend_from_slice(&(stats.gear as i16).to_le_bytes());
-
-    // Instantaneous Power: i16, Watts
-    data.extend_from_slice(&(stats.power as i16).to_le_bytes());
-
-    // Heart Rate: u8, BPM
-    data.push(stats.heart_rate.whole() as u8);
-
-    // Elapsed Time: u16, seconds
+    data.extend_from_slice(&INDOOR_BIKE_DATA_FLAGS.to_le_bytes());
+    data.extend_from_slice(&speed_hundredths_kmh(stats.power).to_le_bytes());
+    data.extend_from_slice(&cadence_half_rpm(stats.cadence).to_le_bytes());
+    data.extend_from_slice(&distance_metres_u24(stats.distance));
+    data.extend_from_slice(&resistance_level(stats.gear).to_le_bytes());
+    data.extend_from_slice(&power_watts(stats.power).to_le_bytes());
+    data.push(heart_rate_bpm(stats.heart_rate));
     data.extend_from_slice(&stats.elapsed_seconds().to_le_bytes());
-
     data
 }
 
-/// Cycling Power Measurement (0x2A63).
-///
-/// Flags 0x0020: Crank Revolution Data present; Instantaneous Power is always
-/// present per the spec.
+/// Cycling Power Measurement (0x2A63): power, then the crank revolution data
+/// the flags declare. Both counters roll over at u16, per spec.
 pub fn serialize_cps(stats: &Sanitized, revolutions: u16, event_time: u16) -> Vec<u8> {
-    let flags: u16 = 0x0020;
     let mut data = Vec::with_capacity(8);
-    data.extend_from_slice(&flags.to_le_bytes());
-
-    // Instantaneous Power: i16, Watts
-    data.extend_from_slice(&(stats.power as i16).to_le_bytes());
-
-    // Cumulative Crank Revolutions: u16 (rolls over)
+    data.extend_from_slice(&CPS_MEASUREMENT_FLAGS.to_le_bytes());
+    data.extend_from_slice(&power_watts(stats.power).to_le_bytes());
     data.extend_from_slice(&revolutions.to_le_bytes());
-
-    // Last Crank Event Time: u16, 1/1024 s (rolls over)
     data.extend_from_slice(&event_time.to_le_bytes());
-
     data
 }
 
-/// Heart Rate Measurement (0x2A37). Flags 0x00: u8 value, no extra fields.
+/// Heart Rate Measurement (0x2A37).
 pub fn serialize_hrs(stats: &Sanitized) -> Vec<u8> {
-    vec![0x00, stats.heart_rate.whole() as u8]
+    vec![HRS_MEASUREMENT_FLAGS, heart_rate_bpm(stats.heart_rate)]
+}
+
+/// Instantaneous Speed: `u16`, 0.01 km/h.
+fn speed_hundredths_kmh(power: u16) -> u16 {
+    (calculate_speed_from_power(power) * 100.0) as u16
+}
+
+/// Instantaneous Cadence: `u16`, 0.5 rpm — two units per rpm, so tenths / 5.
+fn cadence_half_rpm(cadence: Tenths) -> u16 {
+    cadence.0 / 5
+}
+
+/// Total Distance: `u24`, metres, little-endian — tenths of a km × 100.
+fn distance_metres_u24(distance: Tenths) -> [u8; 3] {
+    let metres = u32::from(distance.0) * 100;
+    let [b0, b1, b2, _] = metres.to_le_bytes();
+    [b0, b1, b2]
+}
+
+/// Resistance Level: `i16`; the M3i's gear.
+fn resistance_level(gear: u8) -> i16 {
+    i16::from(gear)
+}
+
+/// Instantaneous Power: `i16`, watts.
+fn power_watts(power: u16) -> i16 {
+    power as i16
+}
+
+/// Heart Rate: `u8`, bpm.
+fn heart_rate_bpm(heart_rate: Tenths) -> u8 {
+    heart_rate.whole() as u8
 }
 
 /// The first payload to send a client that has just subscribed to a notify
@@ -209,6 +221,28 @@ mod tests {
 
     fn le_u16(data: &[u8], offset: usize) -> u16 {
         u16::from_le_bytes([data[offset], data[offset + 1]])
+    }
+
+    #[test]
+    fn given_bike_units_when_encoded_for_the_wire_then_each_field_uses_the_spec_unit() {
+        assert_eq!(
+            cadence_half_rpm(Tenths(850)),
+            170,
+            "85 rpm in half-rpm units"
+        );
+        assert_eq!(cadence_half_rpm(Tenths(855)), 171, "85.5 rpm");
+        assert_eq!(
+            distance_metres_u24(Tenths(45)),
+            [0x94, 0x11, 0x00],
+            "4.5 km = 4500 m"
+        );
+        assert_eq!(
+            distance_metres_u24(Tenths(u16::MAX)),
+            6_553_500u32.to_le_bytes()[..3],
+            "the largest distance still fits three bytes"
+        );
+        assert_eq!(heart_rate_bpm(Tenths(1205)), 120, "120.5 bpm truncates");
+        assert_eq!(speed_hundredths_kmh(0), 0);
     }
 
     #[test]
