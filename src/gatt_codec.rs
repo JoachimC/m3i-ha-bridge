@@ -306,10 +306,11 @@ mod tests {
 
     #[test]
     fn given_the_advertised_services_when_sized_then_the_payload_fits_a_legacy_advertisement() {
-        // Flags (3) + "Keiser M3i #200" (2 + 15) + two 16-bit UUIDs (2 + 4) = 26.
-        // The widest id is three digits, so 200 is the worst case.
-        let size = legacy_advertising_size(&local_name(200), 2);
-        assert_eq!(size, 26);
+        // Flags (3) + "Keiser M3i #200" (2 + 15) + three 16-bit UUIDs (2 + 6)
+        // = 28: Cycling Power, Fitness Machine and, since issue #4, Heart
+        // Rate. The widest id is three digits, so 200 is the worst case.
+        let size = legacy_advertising_size(&local_name(200), 3);
+        assert_eq!(size, 28);
         assert!(
             size <= LEGACY_ADVERTISING_CAPACITY,
             "{size} bytes exceeds the {LEGACY_ADVERTISING_CAPACITY}-byte legacy limit; \
@@ -318,10 +319,10 @@ mod tests {
     }
 
     #[test]
-    fn given_a_third_advertised_service_when_sized_then_there_is_still_headroom() {
-        // Heart Rate is not advertised today, but knowing it would still fit is
+    fn given_a_fourth_advertised_service_when_sized_then_there_is_still_headroom() {
+        // Nothing else is advertised today, but knowing one more would fit is
         // what makes that a choice rather than a constraint.
-        assert!(legacy_advertising_size(&local_name(200), 3) <= LEGACY_ADVERTISING_CAPACITY);
+        assert!(legacy_advertising_size(&local_name(200), 4) <= LEGACY_ADVERTISING_CAPACITY);
     }
 
     fn reading_from(bike_id: u8, power: u16) -> KeiserStats {

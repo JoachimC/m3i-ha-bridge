@@ -72,21 +72,22 @@ mod linux_impl {
     /// never offered, and the pairing flow never gets far enough to read the
     /// service list. FTMS v1.0 §3.1 requires it for that reason.
     ///
-    /// Heart Rate (0x180D) is deliberately left out even though it would fit.
-    /// The bridge only reports a heart rate when the rider's strap is paired to
-    /// the bike, so advertising it would offer HR-pairing screens a sensor that
-    /// usually has nothing to say — and advertising registration on this
-    /// hardware is fragile enough (see the retry and btmgmt fallback below)
-    /// that each addition deserves its own verification.
+    /// Heart Rate (0x180D) is advertised for the same reason (issue #4):
+    /// Zwift's HR pairing screen filters on it identically, so without it a
+    /// rider whose strap is paired to the bike cannot pick the bridge as a
+    /// heart-rate source. The characteristic only notifies while the bike
+    /// reports a rate, so with no strap the sensor is offered but silent —
+    /// the usual case here is a strap being worn.
     fn advertised_service_uuids() -> BTreeSet<bluer::Uuid> {
-        BTreeSet::from([CPS_SERVICE_UUID, FTMS_SERVICE_UUID])
+        BTreeSet::from([CPS_SERVICE_UUID, FTMS_SERVICE_UUID, HRS_SERVICE_UUID])
     }
 
     /// btmgmt fallback for the same advertisement, used when every D-Bus
     /// registration attempt fails. Kept beside [`advertised_service_uuids`]
     /// because the two must list the same services; a test asserts they do.
-    const BTMGMT_ADD_ADV_ARGS: [&str; 9] =
-        ["add-adv", "-u", "1818", "-u", "1826", "-c", "-g", "-n", "1"];
+    const BTMGMT_ADD_ADV_ARGS: [&str; 11] = [
+        "add-adv", "-u", "1818", "-u", "1826", "-u", "180d", "-c", "-g", "-n", "1",
+    ];
 
     /// Serves a subscriber of one notify characteristic: sends the current
     /// stats immediately (when `has_value` says they are worth sending), then
@@ -528,9 +529,11 @@ mod linux_impl {
         }
 
         #[test]
-        fn given_the_advertisement_when_built_then_it_lists_fitness_machine_and_cycling_power() {
-            // 0x1826 is the point of issue #8: clients that filter discovery on
-            // the FTMS UUID never see a trainer that omits it.
+        fn given_the_advertisement_when_built_then_it_lists_every_service_a_pairing_screen_filters_on()
+         {
+            // 0x1826 is the point of issue #8 and 0x180D of issue #4: clients
+            // filter discovery on the advertised UUID, so a service that is
+            // only discoverable after connecting is never offered.
             let advertised = advertised_service_uuids();
             assert!(
                 advertised.contains(&FTMS_SERVICE_UUID),
@@ -539,6 +542,10 @@ mod linux_impl {
             assert!(
                 advertised.contains(&CPS_SERVICE_UUID),
                 "Cycling Power (0x1818)"
+            );
+            assert!(
+                advertised.contains(&HRS_SERVICE_UUID),
+                "Heart Rate (0x180D)"
             );
         }
 
