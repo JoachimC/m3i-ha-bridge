@@ -69,12 +69,6 @@ impl BlePlatform {
         cancel_token: CancellationToken,
         stats_rx: watch::Receiver<Arc<Fleet>>,
     ) -> Result<(), BoxError> {
-        tracing::warn!(
-            "BLE GATT server broadcasting is only supported on Linux (BlueZ). \
-             Broadcasting is disabled on this platform."
-        );
-        let _ = stats_rx;
-        cancel_token.cancelled().await;
-        Ok(())
+        crate::gatt_server::run(cancel_token, stats_rx).await
     }
 }

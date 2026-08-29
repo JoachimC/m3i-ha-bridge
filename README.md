@@ -100,7 +100,9 @@ The Bluetooth reader is the single producer: it parses Keiser advertisements int
 | `gatt_codec.rs` | Pure serializers for the FTMS / Cycling Power / Heart Rate GATT payloads |
 | `gatt_server.rs` | BlueZ (`bluer`) GATT server and advertising — Linux only |
 | `mqtt/` | MQTT output: `config` (broker settings), `topics` (naming), `discovery` (what Home Assistant is told), `publisher` (per-bike state and availability), `connection` (the broker driver, announce and shutdown) |
-| `between_retries_strategy.rs` | Pluggable, cancellable retry backoff for the bridge loop |
+| `retry.rs` | Exponential backoff with jitter for the reader's restarts |
+| `supervisor.rs` | Task supervision, the reader's restart loop, and the exit status |
+| `shutdown.rs` | Termination signals to a cancellation token |
 
 Protocol parsing (`keiser`), payload serialization (`gatt_codec`) and advertising policy (`advertising`) are deliberately free of Bluetooth-stack dependencies, so they build and unit-test on any platform even though the GATT server itself only runs on Linux.
 

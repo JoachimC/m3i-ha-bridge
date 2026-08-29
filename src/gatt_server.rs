@@ -498,3 +498,19 @@ mod linux_impl {
 
 #[cfg(target_os = "linux")]
 pub use linux_impl::run;
+
+/// BlueZ has no cross-platform equivalent: on other platforms the GATT server
+/// is disabled and this parks until cancellation, so the scanner and MQTT
+/// halves of the bridge still run on a dev machine.
+#[cfg(not(target_os = "linux"))]
+pub async fn run(
+    cancel_token: tokio_util::sync::CancellationToken,
+    _stats_rx: tokio::sync::watch::Receiver<std::sync::Arc<crate::stats::Fleet>>,
+) -> Result<(), crate::BoxError> {
+    tracing::warn!(
+        "BLE GATT server broadcasting is only supported on Linux (BlueZ). \
+         Broadcasting is disabled on this platform."
+    );
+    cancel_token.cancelled().await;
+    Ok(())
+}
