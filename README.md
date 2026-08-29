@@ -95,12 +95,13 @@ The Bluetooth reader is the single producer: it parses Keiser advertisements int
 | `scan_bluer.rs` | BLE scanning via `bluer` — Linux only |
 | `scan_btleplug.rs` | BLE scanning via `btleplug` — everywhere else |
 | `ble_platform.rs` | The only module that knows which Bluetooth stack this build uses |
+| `advertising.rs` | Which bike the bridge advertises as, when it switches, and what the advertisement contains — platform-independent, behind the `Advertiser` trait |
 | `gatt_codec.rs` | Pure serializers for the FTMS / Cycling Power / Heart Rate GATT payloads |
 | `gatt_server.rs` | BlueZ (`bluer`) GATT server and advertising — Linux only |
 | `mqtt_publisher.rs` | MQTT state publishing and Home Assistant discovery |
 | `between_retries_strategy.rs` | Pluggable, cancellable retry backoff for the bridge loop |
 
-Protocol parsing (`keiser`) and payload serialization (`gatt_codec`) are deliberately free of Bluetooth-stack dependencies, so they build and unit-test on any platform even though the GATT server itself only runs on Linux.
+Protocol parsing (`keiser`), payload serialization (`gatt_codec`) and advertising policy (`advertising`) are deliberately free of Bluetooth-stack dependencies, so they build and unit-test on any platform even though the GATT server itself only runs on Linux.
 
 ## Development
 

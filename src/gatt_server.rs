@@ -1,15 +1,16 @@
-//! BLE GATT server, Linux only — BlueZ has no cross-platform equivalent.
-//!
-//! `ble_platform` decides whether this is reachable at all; on other platforms
-//! it parks until cancellation instead.
+//! BLE GATT server on BlueZ: the standard fitness services, and the
+//! [`Advertiser`] that puts the advertising policy of `advertising` on the air.
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use crate::BoxError;
+    use crate::advertising::{
+        ADVERTISED_SERVICE_UUIDS, Advertiser, LEGACY_ADVERTISING_CAPACITY, btmgmt_add_adv_args,
+        legacy_advertising_size, sig_uuid, track_advertised_bike,
+    };
     use crate::gatt_codec::{
-        AdvertisedIdTracker, FTMS_FEATURE_VALUE, LEGACY_ADVERTISING_CAPACITY, NewArrivals,
-        cps_has_value, ftms_has_value, hrs_has_value, initial_notification,
-        legacy_advertising_size, serialize_cps, serialize_ftms, serialize_hrs, wrap_u16,
+        CrankAccumulator, FTMS_FEATURE_VALUE, cps_has_value, ftms_has_value, hrs_has_value,
+        initial_notification, serialize_cps, serialize_ftms, serialize_hrs,
     };
     use crate::stats::{BikeId, Fleet, Sanitized, current_snapshot, next_snapshot};
     use bluer::{
@@ -25,44 +26,42 @@ mod linux_impl {
     use std::time::Duration;
     use tokio::sync::watch;
 
-    // UUIDs for standard Bluetooth SIG services and characteristics
-    const FTMS_SERVICE_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x00001826_0000_1000_8000_00805f9b34fb);
-    const FTMS_FEATURE_CHAR_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x00002acc_0000_1000_8000_00805f9b34fb);
-    const INDOOR_BIKE_DATA_CHAR_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x00002ad2_0000_1000_8000_00805f9b34fb);
+    const fn uuid(short: u16) -> bluer::Uuid {
+        bluer::Uuid::from_u128(sig_uuid(short))
+    }
 
-    const CPS_SERVICE_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x00001818_0000_1000_8000_00805f9b34fb);
-    const CPS_FEATURE_CHAR_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x00002a65_0000_1000_8000_00805f9b34fb);
-    const CPS_MEASUREMENT_CHAR_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x00002a63_0000_1000_8000_00805f9b34fb);
-    const CPS_SENSOR_LOCATION_CHAR_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x00002a5d_0000_1000_8000_00805f9b34fb);
+    const FTMS_SERVICE_UUID: bluer::Uuid = uuid(crate::advertising::FITNESS_MACHINE_SERVICE);
+    const FTMS_FEATURE_CHAR_UUID: bluer::Uuid = uuid(0x2acc);
+    const INDOOR_BIKE_DATA_CHAR_UUID: bluer::Uuid = uuid(0x2ad2);
 
-    const HRS_SERVICE_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x0000180d_0000_1000_8000_00805f9b34fb);
-    const HRS_MEASUREMENT_CHAR_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x00002a37_0000_1000_8000_00805f9b34fb);
-    const HRS_BODY_SENSOR_LOCATION_CHAR_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x00002a38_0000_1000_8000_00805f9b34fb);
+    const CPS_SERVICE_UUID: bluer::Uuid = uuid(crate::advertising::CYCLING_POWER_SERVICE);
+    const CPS_FEATURE_CHAR_UUID: bluer::Uuid = uuid(0x2a65);
+    const CPS_MEASUREMENT_CHAR_UUID: bluer::Uuid = uuid(0x2a63);
+    const CPS_SENSOR_LOCATION_CHAR_UUID: bluer::Uuid = uuid(0x2a5d);
 
-    // Device Information Service: how a client that has connected can read
-    // which bike this is, independent of the advertised name.
-    const DIS_SERVICE_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x0000180a_0000_1000_8000_00805f9b34fb);
-    const DIS_MANUFACTURER_NAME_CHAR_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x00002a29_0000_1000_8000_00805f9b34fb);
-    const DIS_MODEL_NUMBER_CHAR_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x00002a24_0000_1000_8000_00805f9b34fb);
-    const DIS_SERIAL_NUMBER_CHAR_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x00002a25_0000_1000_8000_00805f9b34fb);
+    const HRS_SERVICE_UUID: bluer::Uuid = uuid(crate::advertising::HEART_RATE_SERVICE);
+    const HRS_MEASUREMENT_CHAR_UUID: bluer::Uuid = uuid(0x2a37);
+    const HRS_BODY_SENSOR_LOCATION_CHAR_UUID: bluer::Uuid = uuid(0x2a38);
+
+    /// Device Information Service: how a client that has connected can read
+    /// which bike this is, independent of the advertised name.
+    const DIS_SERVICE_UUID: bluer::Uuid = uuid(0x180a);
+    const DIS_MANUFACTURER_NAME_CHAR_UUID: bluer::Uuid = uuid(0x2a29);
+    const DIS_MODEL_NUMBER_CHAR_UUID: bluer::Uuid = uuid(0x2a24);
+    const DIS_SERIAL_NUMBER_CHAR_UUID: bluer::Uuid = uuid(0x2a25);
 
     /// How often each notify loop re-sends the current stats even when no new
     /// advertisement arrived, so clients see values decay to zero on staleness.
     const NOTIFY_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+
+    /// Advertising interval range asked of BlueZ; dropped on retry, since
+    /// some controllers reject custom intervals outright.
+    const ADVERTISING_MIN_INTERVAL: Duration = Duration::from_millis(300);
+    const ADVERTISING_MAX_INTERVAL: Duration = Duration::from_millis(500);
+    /// D-Bus registration attempts before falling back to btmgmt, and the
+    /// pause between them.
+    const ADVERTISING_ATTEMPTS: usize = 5;
+    const ADVERTISING_RETRY_DELAY: Duration = Duration::from_millis(500);
 
     /// Time given to BlueZ between unregistering one advertisement and
     /// registering the next.
@@ -76,30 +75,13 @@ mod linux_impl {
     /// moment later. Same idiom as `SCAN_SETTLE_DELAY` in `scan_bluer.rs`.
     const ADVERTISING_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
-    /// Service UUIDs listed in the advertising packet.
-    ///
-    /// FTMS has to be here, not merely discoverable after connecting: many
-    /// clients — Zwift's FTMS pairing screen among them — filter discovery on
-    /// 0x1826 in the advertising data, so a trainer that omits it is simply
-    /// never offered, and the pairing flow never gets far enough to read the
-    /// service list. FTMS v1.0 §3.1 requires it for that reason.
-    ///
-    /// Heart Rate (0x180D) is advertised for the same reason (issue #4):
-    /// Zwift's HR pairing screen filters on it identically, so without it a
-    /// rider whose strap is paired to the bike cannot pick the bridge as a
-    /// heart-rate source. The characteristic only notifies while the bike
-    /// reports a rate, so with no strap the sensor is offered but silent —
-    /// the usual case here is a strap being worn.
-    fn advertised_service_uuids() -> BTreeSet<bluer::Uuid> {
-        BTreeSet::from([CPS_SERVICE_UUID, FTMS_SERVICE_UUID, HRS_SERVICE_UUID])
-    }
+    /// Time given to BlueZ to process the GATT application's unregistration
+    /// before the process exits — asynchronous for the same reason.
+    const GATT_UNREGISTER_SETTLE_DELAY: Duration = Duration::from_secs(1);
 
-    /// btmgmt fallback for the same advertisement, used when every D-Bus
-    /// registration attempt fails. Kept beside [`advertised_service_uuids`]
-    /// because the two must list the same services; a test asserts they do.
-    const BTMGMT_ADD_ADV_ARGS: [&str; 11] = [
-        "add-adv", "-u", "1818", "-u", "1826", "-u", "180d", "-c", "-g", "-n", "1",
-    ];
+    const BTMGMT: &str = "/usr/bin/btmgmt";
+    /// The advertising instance the btmgmt fallback registers and removes.
+    const BTMGMT_INSTANCE: &str = "1";
 
     /// Serves a subscriber of one notify characteristic: sends the current
     /// stats immediately (when `has_value` says they are worth sending), then
@@ -140,7 +122,7 @@ mod linux_impl {
 
             while let Some(fleet) = next_snapshot(&mut rx, NOTIFY_POLL_INTERVAL).await {
                 let Some(reading) = advertised(&advertised_id).and_then(|id| fleet.get(&id)) else {
-                    continue; // nothing from the advertised bike yet
+                    continue;
                 };
                 let stats = reading.sanitized();
                 if let Err(e) = notifier.notify(serialize(&stats)).await {
@@ -152,37 +134,28 @@ mod linux_impl {
         });
     }
 
-    /// Builds a serializer for the Cycling Power Measurement characteristic.
-    /// CPS is stateful: it must report cumulative crank revolutions and the
-    /// last crank event time (1/1024 s), both wrapping at u16 as per spec.
     fn cps_serializer() -> impl FnMut(&Sanitized) -> Vec<u8> + Send + 'static {
-        let mut cumulative_revolutions: f64 = 0.0;
-        let mut last_event_time: f64 = 0.0;
-        let mut last_update = tokio::time::Instant::now();
+        let mut crank = CrankAccumulator::new(tokio::time::Instant::now());
         move |stats| {
-            let now = tokio::time::Instant::now();
-            let delta_t = now.duration_since(last_update).as_secs_f64();
-            last_update = now;
-
-            if stats.cadence.is_positive() {
-                cumulative_revolutions += (stats.cadence.as_f64() / 60.0) * delta_t;
-                last_event_time += delta_t * 1024.0;
-            }
-
-            serialize_cps(
-                stats,
-                wrap_u16(cumulative_revolutions),
-                wrap_u16(last_event_time),
-            )
+            let (revolutions, event_time) =
+                crank.advance(stats.cadence, tokio::time::Instant::now());
+            serialize_cps(stats, revolutions, event_time)
         }
     }
 
-    fn read_characteristic(uuid: bluer::Uuid, value: &'static [u8]) -> Characteristic {
+    /// A readable characteristic whose value is produced on every read.
+    fn read_characteristic(
+        uuid: bluer::Uuid,
+        value: impl Fn() -> Vec<u8> + Send + Sync + 'static,
+    ) -> Characteristic {
         Characteristic {
             uuid,
             read: Some(CharacteristicRead {
                 read: true,
-                fun: Box::new(move |_req| async move { Ok(value.to_vec()) }.boxed()),
+                fun: Box::new(move |_req| {
+                    let value = value();
+                    async move { Ok(value) }.boxed()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -219,41 +192,27 @@ mod linux_impl {
         }
     }
 
-    /// Serial Number String: the advertised bike's zero-padded id, read live
-    /// so it follows the advertisement when the bridge switches bikes.
-    fn serial_number_characteristic(
-        advertised_id: watch::Receiver<Option<BikeId>>,
-    ) -> Characteristic {
-        Characteristic {
-            uuid: DIS_SERIAL_NUMBER_CHAR_UUID,
-            read: Some(CharacteristicRead {
-                read: true,
-                fun: Box::new(move |_req| {
-                    let serial = advertised_id
-                        .borrow()
-                        .map(|id| id.to_string())
-                        .unwrap_or_default();
-                    async move { Ok(serial.into_bytes()) }.boxed()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
     fn build_application(
         stats_rx: &watch::Receiver<Arc<Fleet>>,
         advertised_id: &watch::Receiver<Option<BikeId>>,
     ) -> Application {
+        let serial_number = {
+            let advertised_id = advertised_id.clone();
+            move || {
+                advertised_id
+                    .borrow()
+                    .map(|id| id.to_string())
+                    .unwrap_or_default()
+                    .into_bytes()
+            }
+        };
         Application {
             services: vec![
-                // 1. Fitness Machine Service (FTMS)
                 Service {
                     uuid: FTMS_SERVICE_UUID,
                     primary: true,
                     characteristics: vec![
-                        // Features: Cadence, Distance, Resistance, HR, Elapsed Time, Power.
-                        read_characteristic(FTMS_FEATURE_CHAR_UUID, &FTMS_FEATURE_VALUE),
+                        read_characteristic(FTMS_FEATURE_CHAR_UUID, || FTMS_FEATURE_VALUE.to_vec()),
                         notify_characteristic(
                             INDOOR_BIKE_DATA_CHAR_UUID,
                             "FTMS (Indoor Bike Data)",
@@ -265,13 +224,12 @@ mod linux_impl {
                     ],
                     ..Default::default()
                 },
-                // 2. Cycling Power Service (CPS)
                 Service {
                     uuid: CPS_SERVICE_UUID,
                     primary: true,
                     characteristics: vec![
-                        // Features: Crank Revolution Data Supported (Bit 3 = 0x08)
-                        read_characteristic(CPS_FEATURE_CHAR_UUID, &[0x08, 0x00, 0x00, 0x00]),
+                        // Crank Revolution Data Supported (bit 3).
+                        read_characteristic(CPS_FEATURE_CHAR_UUID, || vec![0x08, 0x00, 0x00, 0x00]),
                         notify_characteristic(
                             CPS_MEASUREMENT_CHAR_UUID,
                             "CPS (Cycling Power)",
@@ -280,12 +238,11 @@ mod linux_impl {
                             cps_has_value,
                             || Box::new(cps_serializer()),
                         ),
-                        // Sensor Location (required for CPS): 0 = Other
-                        read_characteristic(CPS_SENSOR_LOCATION_CHAR_UUID, &[0x00]),
+                        // Sensor Location (required for CPS): 0 = Other.
+                        read_characteristic(CPS_SENSOR_LOCATION_CHAR_UUID, || vec![0x00]),
                     ],
                     ..Default::default()
                 },
-                // 3. Heart Rate Service (HRS)
                 Service {
                     uuid: HRS_SERVICE_UUID,
                     primary: true,
@@ -298,19 +255,18 @@ mod linux_impl {
                             hrs_has_value,
                             || Box::new(serialize_hrs),
                         ),
-                        // Body Sensor Location: 1 = Chest
-                        read_characteristic(HRS_BODY_SENSOR_LOCATION_CHAR_UUID, &[0x01]),
+                        // Body Sensor Location: 1 = Chest.
+                        read_characteristic(HRS_BODY_SENSOR_LOCATION_CHAR_UUID, || vec![0x01]),
                     ],
                     ..Default::default()
                 },
-                // 4. Device Information Service (DIS): which bike this is.
                 Service {
                     uuid: DIS_SERVICE_UUID,
                     primary: true,
                     characteristics: vec![
-                        read_characteristic(DIS_MANUFACTURER_NAME_CHAR_UUID, b"Keiser"),
-                        read_characteristic(DIS_MODEL_NUMBER_CHAR_UUID, b"M3i"),
-                        serial_number_characteristic(advertised_id.clone()),
+                        read_characteristic(DIS_MANUFACTURER_NAME_CHAR_UUID, || b"Keiser".to_vec()),
+                        read_characteristic(DIS_MODEL_NUMBER_CHAR_UUID, || b"M3i".to_vec()),
+                        read_characteristic(DIS_SERIAL_NUMBER_CHAR_UUID, serial_number),
                     ],
                     ..Default::default()
                 },
@@ -327,19 +283,68 @@ mod linux_impl {
         Btmgmt,
     }
 
-    /// Registers the advertisement under `name`, retrying and finally falling
-    /// back to `btmgmt` — advertising registration on this hardware is fragile
-    /// enough that both are needed.
+    /// Puts advertisements on the air through BlueZ, with the btmgmt fallback.
+    struct BluerAdvertiser {
+        adapter: bluer::Adapter,
+        current: Option<AdvertisingHandle>,
+    }
+
+    impl Advertiser for BluerAdvertiser {
+        async fn advertise(&mut self, name: &str) -> Result<(), BoxError> {
+            self.stop().await;
+            self.current = Some(register_advertisement(&self.adapter, name).await?);
+            Ok(())
+        }
+
+        async fn stop(&mut self) {
+            match self.current.take() {
+                None => {}
+                Some(AdvertisingHandle::DBus(handle)) => {
+                    drop(handle);
+                    tokio::time::sleep(ADVERTISING_SETTLE_DELAY).await;
+                }
+                Some(AdvertisingHandle::Btmgmt) => {
+                    if let Err(e) = run_btmgmt(&["rm-adv", BTMGMT_INSTANCE]).await {
+                        tracing::error!("Failed to remove btmgmt advertisement: {}", e);
+                    } else {
+                        tracing::info!("Removed legacy advertisement via btmgmt.");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Registers the advertisement under `name` via D-Bus, falling back to
+    /// `btmgmt` — advertising registration on this hardware is fragile enough
+    /// that both are needed.
     async fn register_advertisement(
         adapter: &bluer::Adapter,
         name: &str,
     ) -> Result<AdvertisingHandle, BoxError> {
-        let service_uuids = advertised_service_uuids();
+        warn_if_oversized(name);
+        match advertise_via_dbus(adapter, name).await {
+            Ok(handle) => Ok(AdvertisingHandle::DBus(handle)),
+            Err(dbus_error) => {
+                tracing::warn!(
+                    "All D-Bus advertising attempts failed ({}). Falling back to btmgmt...",
+                    dbus_error
+                );
+                match advertise_via_btmgmt(adapter, name).await {
+                    Ok(()) => Ok(AdvertisingHandle::Btmgmt),
+                    Err(btmgmt_error) => {
+                        tracing::error!("btmgmt fallback also failed: {}", btmgmt_error);
+                        Err(dbus_error.into())
+                    }
+                }
+            }
+        }
+    }
 
-        // BlueZ rejects an oversized advertisement with a generic D-Bus error,
-        // which the retry loop below then reports five times without ever
-        // saying what is wrong. Say it up front instead.
-        let payload_size = legacy_advertising_size(name, service_uuids.len());
+    /// BlueZ rejects an oversized advertisement with a generic D-Bus error,
+    /// which the retry loop then reports several times without ever saying
+    /// what is wrong. Say it up front instead.
+    fn warn_if_oversized(name: &str) {
+        let payload_size = legacy_advertising_size(name, ADVERTISED_SERVICE_UUIDS.len());
         if payload_size > LEGACY_ADVERTISING_CAPACITY {
             tracing::warn!(
                 "Advertising payload is {} bytes, over the {}-byte legacy limit; \
@@ -347,106 +352,65 @@ mod linux_impl {
                 payload_size,
                 LEGACY_ADVERTISING_CAPACITY
             );
-        } else {
-            tracing::debug!(
-                "Advertising {} service UUIDs in {} of {} bytes",
-                service_uuids.len(),
-                payload_size,
-                LEGACY_ADVERTISING_CAPACITY
-            );
         }
+    }
 
-        let mut le_advertisement = Advertisement {
+    /// One attempt with the preferred intervals, then the remaining attempts
+    /// without them.
+    async fn advertise_via_dbus(
+        adapter: &bluer::Adapter,
+        name: &str,
+    ) -> Result<AdvertisementHandle, bluer::Error> {
+        let service_uuids: BTreeSet<bluer::Uuid> =
+            ADVERTISED_SERVICE_UUIDS.into_iter().map(uuid).collect();
+        let mut advertisement = Advertisement {
             advertisement_type: bluer::adv::Type::Peripheral,
             service_uuids,
             discoverable: Some(true),
             local_name: Some(name.to_string()),
-            min_interval: Some(std::time::Duration::from_millis(300)),
-            max_interval: Some(std::time::Duration::from_millis(500)),
+            min_interval: Some(ADVERTISING_MIN_INTERVAL),
+            max_interval: Some(ADVERTISING_MAX_INTERVAL),
             ..Default::default()
         };
 
-        let mut retries = 5;
-        let mut try_without_intervals = false;
-
-        loop {
-            if try_without_intervals {
-                le_advertisement.min_interval = None;
-                le_advertisement.max_interval = None;
-            }
-
-            match adapter.advertise(le_advertisement.clone()).await {
-                Ok(handle) => return Ok(AdvertisingHandle::DBus(handle)),
+        let mut last_error = None;
+        for attempt in 1..=ADVERTISING_ATTEMPTS {
+            match adapter.advertise(advertisement.clone()).await {
+                Ok(handle) => return Ok(handle),
                 Err(e) => {
-                    retries -= 1;
                     tracing::warn!(
-                        "Failed to register BLE advertisement via BlueZ D-Bus (retries left: {}): {}. {}",
-                        retries,
-                        e,
-                        if !try_without_intervals {
-                            "Retrying without custom intervals next..."
-                        } else {
-                            "Retrying..."
-                        }
+                        "Failed to register BLE advertisement via BlueZ D-Bus (attempt {} of {}): {}",
+                        attempt,
+                        ADVERTISING_ATTEMPTS,
+                        e
                     );
-                    try_without_intervals = true;
-                    if retries > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        continue;
-                    }
-
-                    tracing::warn!(
-                        "All D-Bus advertising attempts failed. Falling back to manual btmgmt legacy advertising..."
-                    );
-
-                    // btmgmt's -n flag advertises the adapter's own alias, so
-                    // the bike's name has to be set there first. BlueZ persists
-                    // the alias on disk; `run` restores the original at shutdown.
-                    if let Err(alias_err) = adapter.set_alias(name.to_string()).await {
-                        tracing::warn!("Could not set adapter alias to {:?}: {}", name, alias_err);
-                    }
-
-                    // Try clearing any existing instance 1 first
-                    let _ = run_btmgmt(&["rm-adv", "1"]).await;
-
-                    // Register using btmgmt. The -u list must mirror
-                    // advertised_service_uuids(), or the fallback path
-                    // silently drops FTMS and the trainer stops appearing
-                    // in FTMS pairing screens exactly when D-Bus
-                    // registration is already misbehaving.
-                    return match run_btmgmt(&BTMGMT_ADD_ADV_ARGS).await {
-                        Ok(_) => {
-                            tracing::info!(
-                                "Successfully registered legacy advertisement via btmgmt fallback!"
-                            );
-                            Ok(AdvertisingHandle::Btmgmt)
-                        }
-                        Err(bt_err) => {
-                            tracing::error!("btmgmt fallback also failed: {}", bt_err);
-                            Err(e.into())
-                        }
-                    };
+                    last_error = Some(e);
                 }
             }
+            advertisement.min_interval = None;
+            advertisement.max_interval = None;
+            if attempt < ADVERTISING_ATTEMPTS {
+                tokio::time::sleep(ADVERTISING_RETRY_DELAY).await;
+            }
         }
+        Err(last_error.expect("at least one attempt was made"))
     }
 
-    /// Unregisters an advertisement and waits for BlueZ to have processed it,
-    /// so the caller may register another immediately afterwards.
-    async fn unregister_advertisement(handle: AdvertisingHandle) {
-        match handle {
-            AdvertisingHandle::DBus(handle) => {
-                drop(handle);
-                tokio::time::sleep(ADVERTISING_SETTLE_DELAY).await;
-            }
-            AdvertisingHandle::Btmgmt => {
-                if let Err(e) = run_btmgmt(&["rm-adv", "1"]).await {
-                    tracing::error!("Failed to remove btmgmt advertisement: {}", e);
-                } else {
-                    tracing::info!("Successfully removed legacy advertisement via btmgmt.");
-                }
-            }
+    /// btmgmt's `-n` flag advertises the adapter's own alias, so the bike's
+    /// name has to be set there first. BlueZ persists the alias on disk;
+    /// [`run`] restores the original at shutdown.
+    async fn advertise_via_btmgmt(adapter: &bluer::Adapter, name: &str) -> Result<(), BoxError> {
+        if let Err(e) = adapter.set_alias(name.to_string()).await {
+            tracing::warn!("Could not set adapter alias to {:?}: {}", name, e);
         }
+        // A previous process that died without cleaning up may have left the
+        // instance registered.
+        let _ = run_btmgmt(&["rm-adv", BTMGMT_INSTANCE]).await;
+        let args = btmgmt_add_adv_args();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_btmgmt(&args).await?;
+        tracing::info!("Registered legacy advertisement via btmgmt fallback.");
+        Ok(())
     }
 
     /// Takes the session rather than opening one: the scanner and the GATT
@@ -472,7 +436,6 @@ mod linux_impl {
             adapter.address().await?
         );
 
-        // What the advertisement currently says, for the DIS serial number.
         let (advertised_tx, advertised_rx) = watch::channel(None);
 
         tracing::info!("Registering GATT application...");
@@ -480,66 +443,19 @@ mod linux_impl {
         let app_handle = adapter.serve_gatt_application(app).await?;
         tracing::info!("GATT application served successfully.");
 
-        // Issue #6: nothing is advertised until a bike has been heard, and the
-        // name then carries that bike's id. The tracker decides when a
-        // different bike has held the "latest" slot long enough to take over.
-        let mut stats_rx = stats_rx;
-        let mut tracker = AdvertisedIdTracker::default();
-        let mut arrivals = NewArrivals::default();
-        let mut advertisement: Option<AdvertisingHandle> = None;
+        let mut advertiser = BluerAdvertiser {
+            adapter: adapter.clone(),
+            current: None,
+        };
+        let result =
+            track_advertised_bike(&mut advertiser, stats_rx, &advertised_tx, cancel_token).await;
 
-        for bike_id in arrivals.new_in(&current_snapshot(&mut stats_rx)) {
-            tracker.observe(bike_id, tokio::time::Instant::now());
-        }
-        tracing::info!("Waiting for a bike before advertising...");
-
-        loop {
-            let snapshot = tokio::select! {
-                _ = cancel_token.cancelled() => break,
-                snapshot = next_snapshot(&mut stats_rx, NOTIFY_POLL_INTERVAL) => snapshot,
-            };
-            let now = tokio::time::Instant::now();
-            match snapshot {
-                Some(fleet) => {
-                    for bike_id in arrivals.new_in(&fleet) {
-                        tracker.observe(bike_id, now);
-                    }
-                }
-                None => {
-                    // The producer is gone; keep serving what is registered
-                    // until shutdown, as before.
-                    cancel_token.cancelled().await;
-                    break;
-                }
-            }
-
-            if let Some(bike_id) = tracker.take_due(now) {
-                let name = bike_id.display_name();
-                if let Some(previous) = advertisement.take() {
-                    tracing::info!("Re-advertising as {:?}", name);
-                    unregister_advertisement(previous).await;
-                } else {
-                    tracing::info!("Advertising as {:?}", name);
-                }
-                // Fail fast, per the module policy: a registration that fails
-                // even via btmgmt does not heal in-process.
-                advertisement = Some(register_advertisement(&adapter, &name).await?);
-                let _ = advertised_tx.send(Some(bike_id));
-                tracing::info!("BLE broadcasting active as {:?}", name);
-            }
-        }
-
-        tracing::info!("Shutting down BLE GATT server and advertising...");
-        if let Some(handle) = advertisement {
-            unregister_advertisement(handle).await;
-        }
+        tracing::info!("Shutting down BLE GATT server...");
         drop(app_handle);
         restore_alias(&adapter, &original_alias).await;
-        // Same reason as the settle delay: the GATT application's
-        // unregistration is asynchronous too, and this process exits next.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(GATT_UNREGISTER_SETTLE_DELAY).await;
 
-        Ok(())
+        result
     }
 
     /// Puts the adapter's alias back if the btmgmt fallback changed it.
@@ -559,7 +475,7 @@ mod linux_impl {
     }
 
     async fn run_btmgmt(args: &[&str]) -> Result<(), BoxError> {
-        let mut cmd = tokio::process::Command::new("/usr/bin/btmgmt");
+        let mut cmd = tokio::process::Command::new(BTMGMT);
         cmd.args(args);
         let output = cmd.output().await?;
         if output.status.success() {
@@ -576,70 +492,6 @@ mod linux_impl {
                 stderr.trim()
             )
             .into())
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        /// The 16-bit alias of a Bluetooth SIG base UUID, as it appears in the
-        /// advertising packet and in btmgmt's `-u` arguments.
-        fn short_uuid(uuid: bluer::Uuid) -> String {
-            format!("{:04x}", (uuid.as_u128() >> 96) as u16)
-        }
-
-        #[test]
-        fn given_the_advertisement_when_built_then_it_lists_every_service_a_pairing_screen_filters_on()
-         {
-            // 0x1826 is the point of issue #8 and 0x180D of issue #4: clients
-            // filter discovery on the advertised UUID, so a service that is
-            // only discoverable after connecting is never offered.
-            let advertised = advertised_service_uuids();
-            assert!(
-                advertised.contains(&FTMS_SERVICE_UUID),
-                "Fitness Machine (0x1826)"
-            );
-            assert!(
-                advertised.contains(&CPS_SERVICE_UUID),
-                "Cycling Power (0x1818)"
-            );
-            assert!(
-                advertised.contains(&HRS_SERVICE_UUID),
-                "Heart Rate (0x180D)"
-            );
-        }
-
-        #[test]
-        fn given_the_btmgmt_fallback_when_compared_then_it_advertises_the_same_services() {
-            // The fallback runs precisely when D-Bus registration is already
-            // failing, so a divergence here would only ever show up on a Pi
-            // that is having a bad day.
-            let via_btmgmt: BTreeSet<String> = BTMGMT_ADD_ADV_ARGS
-                .windows(2)
-                .filter(|pair| pair[0] == "-u")
-                .map(|pair| pair[1].to_string())
-                .collect();
-            let via_dbus: BTreeSet<String> = advertised_service_uuids()
-                .iter()
-                .copied()
-                .map(short_uuid)
-                .collect();
-
-            assert_eq!(via_btmgmt, via_dbus);
-        }
-
-        #[test]
-        fn given_the_advertisement_when_sized_then_it_fits_a_legacy_advertising_packet() {
-            // Three digits is the widest id, so bike 200 is the longest name.
-            let size = legacy_advertising_size(
-                &BikeId(200).display_name(),
-                advertised_service_uuids().len(),
-            );
-            assert!(
-                size <= LEGACY_ADVERTISING_CAPACITY,
-                "advertisement needs {size} bytes, over the {LEGACY_ADVERTISING_CAPACITY}-byte \
-                 legacy limit — BlueZ would refuse to register it"
-            );
         }
     }
 }

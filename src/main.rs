@@ -15,6 +15,8 @@
 //! Whichever ends the process, the exit status reflects it: zero for a signal,
 //! non-zero for a task failure.
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod advertising;
 mod between_retries_strategy;
 mod ble_platform;
 mod bluetooth_hal;
