@@ -391,7 +391,8 @@ mod linux_impl {
                     );
 
                     // btmgmt's -n flag advertises the adapter's own alias, so
-                    // the bike's name has to be set there first.
+                    // the bike's name has to be set there first. BlueZ persists
+                    // the alias on disk; `run` restores the original at shutdown.
                     if let Err(alias_err) = adapter.set_alias(name.to_string()).await {
                         tracing::warn!("Could not set adapter alias to {:?}: {}", name, alias_err);
                     }
@@ -451,6 +452,10 @@ mod linux_impl {
 
         let adapter = session.default_adapter().await?;
         adapter.set_powered(true).await?;
+        // The btmgmt fallback renames the adapter, and BlueZ persists that in
+        // /var/lib/bluetooth across restarts and reboots, so remember what to
+        // put back.
+        let original_alias = adapter.alias().await?;
 
         tracing::info!(
             "Serving standard BLE services on adapter {} with address {}",
@@ -520,11 +525,28 @@ mod linux_impl {
             unregister_advertisement(handle).await;
         }
         drop(app_handle);
+        restore_alias(&adapter, &original_alias).await;
         // Same reason as the settle delay: the GATT application's
         // unregistration is asynchronous too, and this process exits next.
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         Ok(())
+    }
+
+    /// Puts the adapter's alias back if the btmgmt fallback changed it.
+    async fn restore_alias(adapter: &bluer::Adapter, original: &str) {
+        match adapter.alias().await {
+            Ok(current) if current == original => {}
+            Ok(current) => match adapter.set_alias(original.to_string()).await {
+                Ok(()) => tracing::info!(
+                    "Restored adapter alias {:?} (was {:?} while advertising)",
+                    original,
+                    current
+                ),
+                Err(e) => tracing::warn!("Could not restore adapter alias {:?}: {}", original, e),
+            },
+            Err(e) => tracing::warn!("Could not read adapter alias to restore it: {}", e),
+        }
     }
 
     async fn run_btmgmt(args: &[&str]) -> Result<(), BoxError> {
@@ -534,8 +556,16 @@ mod linux_impl {
         if output.status.success() {
             Ok(())
         } else {
-            let err = String::from_utf8_lossy(&output.stderr).into_owned();
-            Err(format!("btmgmt failed: {err}").into())
+            // btmgmt reports its failures on stdout, not stderr.
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!(
+                "btmgmt {} failed: {}{}",
+                args.join(" "),
+                stdout.trim(),
+                stderr.trim()
+            )
+            .into())
         }
     }
 
