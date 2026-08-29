@@ -64,6 +64,18 @@ mod linux_impl {
     /// advertisement arrived, so clients see values decay to zero on staleness.
     const NOTIFY_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
+    /// Time given to BlueZ between unregistering one advertisement and
+    /// registering the next.
+    ///
+    /// Dropping a bluer `AdvertisementHandle` does not unregister anything
+    /// synchronously: it signals a spawned task, which then sends
+    /// `UnregisterAdvertisement` over D-Bus. Without a pause, the new
+    /// `RegisterAdvertisement` can reach bluetoothd while the old instance is
+    /// still live, fail with a generic D-Bus error, exhaust the retries and
+    /// drop into the btmgmt fallback for a switch that would have worked a
+    /// moment later. Same idiom as `SCAN_SETTLE_DELAY` in `scan_bluer.rs`.
+    const ADVERTISING_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
     /// Service UUIDs listed in the advertising packet.
     ///
     /// FTMS has to be here, not merely discoverable after connecting: many
@@ -409,9 +421,14 @@ mod linux_impl {
         }
     }
 
+    /// Unregisters an advertisement and waits for BlueZ to have processed it,
+    /// so the caller may register another immediately afterwards.
     async fn unregister_advertisement(handle: AdvertisingHandle) {
         match handle {
-            AdvertisingHandle::DBus(handle) => drop(handle),
+            AdvertisingHandle::DBus(handle) => {
+                drop(handle);
+                tokio::time::sleep(ADVERTISING_SETTLE_DELAY).await;
+            }
             AdvertisingHandle::Btmgmt => {
                 if let Err(e) = run_btmgmt(&["rm-adv", "1"]).await {
                     tracing::error!("Failed to remove btmgmt advertisement: {}", e);
@@ -503,6 +520,8 @@ mod linux_impl {
             unregister_advertisement(handle).await;
         }
         drop(app_handle);
+        // Same reason as the settle delay: the GATT application's
+        // unregistration is asynchronous too, and this process exits next.
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         Ok(())
