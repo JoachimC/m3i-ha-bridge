@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -133,15 +134,81 @@ impl MqttConfig {
     }
 }
 
-/// A message the state loop wants sent. Everything here goes out at QoS 0:
-/// [`is_offline_publish`] identifies the shutdown's `offline` message by
-/// counting QoS 1 packet ids the driver did not queue, and a QoS 1 publish from
-/// this loop would be mistaken for it.
+/// A message to send. Retained messages (discovery, availability) go out at
+/// QoS 1 so a loss on the wire is retried; state is QoS 0 because the next
+/// reading supersedes it within seconds anyway.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutgoingMessage {
     pub topic: String,
     pub payload: String,
     pub retain: bool,
+    pub qos: QoS,
+}
+
+impl OutgoingMessage {
+    fn retained(topic: String, payload: impl Into<String>) -> Self {
+        Self {
+            topic,
+            payload: payload.into(),
+            retain: true,
+            qos: QoS::AtLeastOnce,
+        }
+    }
+
+    fn state(topic: String, payload: String) -> Self {
+        Self {
+            topic,
+            payload,
+            retain: false,
+            qos: QoS::AtMostOnce,
+        }
+    }
+}
+
+/// Accounts for every QoS 1 publish queued for the event loop, from whichever
+/// task queued it, so the driver can tell the shutdown's `offline` message
+/// apart from the rest.
+///
+/// rumqttc assigns packet ids inside the event loop, so the offline message's
+/// id can only be learned by watching the outgoing events. The request channel
+/// is FIFO and ids are assigned in dequeue order, so the first outgoing QoS 1
+/// publish that nobody has accounted for is the offline one — the one publish
+/// that is deliberately not recorded here. Without the ledger, a SIGTERM
+/// arriving while retained configs were still in flight would latch onto the
+/// wrong packet id and wait for an acknowledgement that had already been and
+/// gone.
+#[derive(Debug, Clone, Default)]
+struct Qos1Ledger(Arc<AtomicUsize>);
+
+impl Qos1Ledger {
+    /// Records a QoS 1 publish about to be queued. Recorded *before* queuing:
+    /// the driver may dequeue it before the caller runs again.
+    fn queued(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Undoes [`queued`](Self::queued) for a publish the channel rejected.
+    fn not_queued(&self) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+    }
+
+    /// A connection error discards whatever was queued for the old
+    /// connection, so their outgoing events will never arrive.
+    fn forget_pending(&self) {
+        self.0.store(0, Ordering::SeqCst);
+    }
+
+    /// Whether an outgoing QoS 1 publish is the shutdown's `offline` message
+    /// rather than one someone recorded here.
+    fn is_offline_publish(&self, shutting_down: bool) -> bool {
+        let accounted_for = self
+            .0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        !accounted_for && shutting_down
+    }
 }
 
 /// What the publisher knows about one bike.
@@ -199,11 +266,7 @@ impl BikePublisher {
                 );
                 self.known_bikes.lock().unwrap().insert(bike_id);
                 let (topic, payload) = discovery_message(&self.config, bike_id);
-                vec![OutgoingMessage {
-                    topic,
-                    payload: payload.to_string(),
-                    retain: true,
-                }]
+                vec![OutgoingMessage::retained(topic, payload.to_string())]
             }
         }
     }
@@ -216,11 +279,10 @@ impl BikePublisher {
         for (&bike_id, bike) in &mut self.bikes {
             let online = !bike.stats.is_stale();
             if bike.published_online != Some(online) {
-                let message = OutgoingMessage {
-                    topic: self.config.bike_availability_topic(bike_id),
-                    payload: if online { "online" } else { "offline" }.to_string(),
-                    retain: true,
-                };
+                let message = OutgoingMessage::retained(
+                    self.config.bike_availability_topic(bike_id),
+                    if online { "online" } else { "offline" },
+                );
                 if publish(&message) {
                     bike.published_online = Some(online);
                 }
@@ -230,11 +292,7 @@ impl BikePublisher {
             if !bike.gate.should_publish(&payload, now) {
                 continue;
             }
-            let message = OutgoingMessage {
-                topic: self.config.state_topic(bike_id),
-                payload,
-                retain: false,
-            };
+            let message = OutgoingMessage::state(self.config.state_topic(bike_id), payload);
             if publish(&message) {
                 bike.gate.record_published(message.payload, now);
             }
@@ -262,24 +320,30 @@ impl BikePublisher {
     fn offline_messages(&self) -> Vec<OutgoingMessage> {
         self.bikes
             .keys()
-            .map(|&bike_id| OutgoingMessage {
-                topic: self.config.bike_availability_topic(bike_id),
-                payload: "offline".to_string(),
-                retain: true,
+            .map(|&bike_id| {
+                OutgoingMessage::retained(self.config.bike_availability_topic(bike_id), "offline")
             })
             .collect()
     }
 }
 
-fn try_send(client: &AsyncClient, message: &OutgoingMessage) -> bool {
+/// Queues a message, reporting whether the channel accepted it.
+fn try_send(client: &AsyncClient, ledger: &Qos1Ledger, message: &OutgoingMessage) -> bool {
+    let qos1 = message.qos != QoS::AtMostOnce;
+    if qos1 {
+        ledger.queued();
+    }
     match client.try_publish(
         &message.topic,
-        QoS::AtMostOnce,
+        message.qos,
         message.retain,
         message.payload.clone(),
     ) {
         Ok(()) => true,
         Err(e) => {
+            if qos1 {
+                ledger.not_queued();
+            }
             tracing::debug!("MQTT publish to {} skipped: {}", message.topic, e);
             false
         }
@@ -434,6 +498,7 @@ pub async fn run(
     let (client, eventloop) = AsyncClient::new(options, REQUEST_CHANNEL_CAPACITY);
 
     let known_bikes = Arc::new(Mutex::new(BTreeSet::new()));
+    let ledger = Qos1Ledger::default();
     // Bumped by the driver on every ConnAck, so the state loop can re-send
     // what the broker may have lost.
     let (connected_tx, mut connected_rx) = watch::channel(0u64);
@@ -447,6 +512,7 @@ pub async fn run(
         client.clone(),
         config.clone(),
         known_bikes.clone(),
+        ledger.clone(),
         connected_tx,
         cancel_token.clone(),
     ));
@@ -473,14 +539,16 @@ pub async fn run(
             publisher.reconnected();
         }
         for message in publisher.observe(stats) {
-            try_send(&client, &message);
+            try_send(&client, &ledger, &message);
         }
-        publisher.tick(Instant::now(), |message| try_send(&client, message));
+        publisher.tick(Instant::now(), |message| {
+            try_send(&client, &ledger, message)
+        });
     }
 
     tracing::info!("Shutting down MQTT publisher...");
     for message in publisher.offline_messages() {
-        try_send(&client, &message);
+        try_send(&client, &ledger, &message);
     }
     shutdown(&client, &config, driver).await;
 
@@ -545,23 +613,22 @@ async fn drive_connection(
     client: AsyncClient,
     config: MqttConfig,
     known_bikes: Arc<Mutex<BTreeSet<u8>>>,
+    ledger: Qos1Ledger,
     connected: watch::Sender<u64>,
     cancel_token: CancellationToken,
 ) {
-    let mut driver_queued = 0;
-
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::ConnAck(_))) if !cancel_token.is_cancelled() => {
                 tracing::info!("Connected to MQTT broker");
                 let bikes = known_bikes.lock().unwrap().clone();
-                driver_queued = announce(&client, &config, &bikes);
+                announce(&client, &ledger, &config, &bikes);
                 connected.send_modify(|generation| *generation += 1);
             }
             // A non-zero packet id means a QoS 1 publish reached the socket;
-            // the QoS 0 state publishes always report packet id 0.
+            // QoS 0 publishes always report packet id 0.
             Ok(Event::Outgoing(Outgoing::Publish(pkid))) if pkid != 0 => {
-                if is_offline_publish(&mut driver_queued, cancel_token.is_cancelled()) {
+                if ledger.is_offline_publish(cancel_token.is_cancelled()) {
                     finish_shutdown(&mut eventloop, &client, pkid).await;
                     return;
                 }
@@ -571,30 +638,12 @@ async fn drive_connection(
             Err(e) => {
                 // Anything queued for the old connection is gone; the next
                 // ConnAck will announce again.
-                driver_queued = 0;
+                ledger.forget_pending();
                 tracing::warn!("MQTT connection error: {e}. Retrying in {RECONNECT_DELAY:?}...");
                 tokio::time::sleep(RECONNECT_DELAY).await;
             }
         }
     }
-}
-
-/// Whether an outgoing QoS 1 publish is the shutdown's retained `offline`
-/// message rather than one of [`announce`]'s retained discovery configs.
-///
-/// rumqttc assigns packet ids inside the event loop, so the offline message's
-/// id can only be learned by watching the outgoing events. The request channel
-/// is FIFO and ids are assigned in dequeue order, so the first QoS 1 publish
-/// the driver did *not* queue itself is the offline one. Without the count, a
-/// SIGTERM arriving while `announce`'s retained configs were still in flight
-/// would latch onto the wrong packet id and then wait for an acknowledgement
-/// that had already been and gone.
-fn is_offline_publish(driver_queued: &mut usize, shutting_down: bool) -> bool {
-    if *driver_queued > 0 {
-        *driver_queued -= 1;
-        return false;
-    }
-    shutting_down
 }
 
 /// Waits for the broker to acknowledge the retained `offline` publish, then
@@ -657,27 +706,32 @@ async fn finish_shutdown(eventloop: &mut EventLoop, client: &AsyncClient, offlin
 /// For the same reason `announce` is not spawned: a spawned task could
 /// interleave its retained configs with a second reconnect's, and with adequate
 /// capacity there is nothing for spawning to buy.
-fn announce(client: &AsyncClient, config: &MqttConfig, bikes: &BTreeSet<u8>) -> usize {
-    let mut queued = 0;
-
-    match client.try_publish(
+fn announce(
+    client: &AsyncClient,
+    ledger: &Qos1Ledger,
+    config: &MqttConfig,
+    bikes: &BTreeSet<u8>,
+) -> usize {
+    let mut messages = vec![OutgoingMessage::retained(
         config.bridge_availability_topic(),
-        QoS::AtLeastOnce,
-        true,
         "online",
-    ) {
-        Ok(()) => queued += 1,
-        Err(e) => tracing::warn!("Failed to publish MQTT availability: {}", e),
-    }
-
-    for &bike_id in bikes {
+    )];
+    messages.extend(bikes.iter().map(|&bike_id| {
         let (topic, payload) = discovery_message(config, bike_id);
-        match client.try_publish(topic, QoS::AtLeastOnce, true, payload.to_string()) {
-            Ok(()) => queued += 1,
-            Err(e) => tracing::warn!("Failed to publish MQTT discovery config: {}", e),
-        }
-    }
+        OutgoingMessage::retained(topic, payload.to_string())
+    }));
 
+    let queued = messages
+        .iter()
+        .filter(|message| try_send(client, ledger, message))
+        .count();
+    if queued < messages.len() {
+        tracing::warn!(
+            "Only {} of {} MQTT announce messages could be queued",
+            queued,
+            messages.len()
+        );
+    }
     queued
 }
 
@@ -1439,11 +1493,7 @@ mod tests {
 
         assert_eq!(
             sent[0],
-            OutgoingMessage {
-                topic: "m3i/042/availability".into(),
-                payload: "online".into(),
-                retain: true,
-            },
+            OutgoingMessage::retained("m3i/042/availability".into(), "online"),
             "availability precedes state, so HA never sees state for an offline bike"
         );
         assert_eq!(sent[1].topic, "m3i/042/state");
@@ -1573,16 +1623,8 @@ mod tests {
         assert_eq!(
             offline,
             vec![
-                OutgoingMessage {
-                    topic: "m3i/001/availability".into(),
-                    payload: "offline".into(),
-                    retain: true,
-                },
-                OutgoingMessage {
-                    topic: "m3i/002/availability".into(),
-                    payload: "offline".into(),
-                    retain: true,
-                },
+                OutgoingMessage::retained("m3i/001/availability".into(), "offline"),
+                OutgoingMessage::retained("m3i/002/availability".into(), "offline"),
             ]
         );
     }
@@ -1616,7 +1658,12 @@ mod tests {
         let config = test_config();
         let (client, rx) = test_client(REQUEST_CHANNEL_CAPACITY);
 
-        let queued = announce(&client, &config, &BTreeSet::from([BIKE]));
+        let queued = announce(
+            &client,
+            &Qos1Ledger::default(),
+            &config,
+            &BTreeSet::from([BIKE]),
+        );
 
         let expected = 2; // availability + one device config
         assert_eq!(queued, expected, "announce should report what it queued");
@@ -1654,8 +1701,9 @@ mod tests {
 
         // Two bursts back to back, as a flapping connection produces, still fit
         // in the channel.
-        assert_eq!(announce(&client, &config, &bikes), burst);
-        assert_eq!(announce(&client, &config, &bikes), burst);
+        let ledger = Qos1Ledger::default();
+        assert_eq!(announce(&client, &ledger, &config, &bikes), burst);
+        assert_eq!(announce(&client, &ledger, &config, &bikes), burst);
         assert_eq!(queued_publishes(&rx).len(), burst * 2);
     }
 
@@ -1668,7 +1716,12 @@ mod tests {
         let (client, _rx) = test_client(3);
 
         assert_eq!(
-            announce(&client, &config, &BTreeSet::from([1, 2, 3, 4])),
+            announce(
+                &client,
+                &Qos1Ledger::default(),
+                &config,
+                &BTreeSet::from([1, 2, 3, 4])
+            ),
             3,
             "only what fits is queued"
         );
@@ -1741,46 +1794,98 @@ mod tests {
     }
 
     #[test]
-    fn given_announce_publishes_still_in_flight_when_shutting_down_then_they_are_not_mistaken_for_it()
-     {
-        // The attribution problem: packet ids are assigned inside the event
-        // loop, so the offline message can only be identified by counting. A
-        // SIGTERM arriving while announce's retained configs are still in
-        // flight must not latch onto one of those ids -- the handshake would
-        // then wait for an acknowledgement that had already been and gone.
-        let mut driver_queued = 8;
+    fn given_publishes_still_in_flight_when_shutting_down_then_they_are_not_mistaken_for_offline() {
+        // Packet ids are assigned inside the event loop, so the offline
+        // message can only be identified by counting. A SIGTERM arriving while
+        // retained configs are still in flight must not latch onto one of
+        // their ids -- the handshake would then wait for an acknowledgement
+        // that had already been and gone.
+        let ledger = Qos1Ledger::default();
+        for _ in 0..8 {
+            ledger.queued();
+        }
         for remaining in (1..=8).rev() {
             assert!(
-                !is_offline_publish(&mut driver_queued, true),
-                "a discovery config is not the offline message ({remaining} left)"
+                !ledger.is_offline_publish(true),
+                "an accounted-for publish is not the offline message ({remaining} left)"
             );
         }
-        assert_eq!(driver_queued, 0);
-        assert!(is_offline_publish(&mut driver_queued, true), "this one is");
+        assert!(ledger.is_offline_publish(true), "this one is");
     }
 
     #[test]
     fn given_no_shutdown_in_progress_when_a_qos1_publish_goes_out_then_it_is_not_the_offline_message()
      {
-        let mut driver_queued = 0;
-        assert!(!is_offline_publish(&mut driver_queued, false));
+        assert!(!Qos1Ledger::default().is_offline_publish(false));
     }
 
     #[test]
-    fn given_a_connection_error_when_the_count_is_reset_then_attribution_recovers() {
+    fn given_a_connection_error_when_pending_publishes_are_forgotten_then_attribution_recovers() {
         // A connection error discards whatever was queued for the old
-        // connection, so `drive_connection` resets the count with it.
-        // Otherwise the driver would skip that many outgoing publishes on the
-        // new connection and could sail straight past the offline message.
-        let mut driver_queued = 8;
-        assert!(!is_offline_publish(&mut driver_queued, true));
-        assert_eq!(
-            driver_queued, 7,
-            "publishes that never went out are still counted"
-        );
+        // connection. Otherwise the driver would skip that many outgoing
+        // publishes on the new connection and sail past the offline message.
+        let ledger = Qos1Ledger::default();
+        for _ in 0..8 {
+            ledger.queued();
+        }
+        assert!(!ledger.is_offline_publish(true));
 
-        driver_queued = 0; // what drive_connection does on a connection error
-        assert!(is_offline_publish(&mut driver_queued, true));
+        ledger.forget_pending();
+        assert!(ledger.is_offline_publish(true));
+    }
+
+    #[test]
+    fn given_qos1_publishes_from_the_state_loop_when_shutting_down_then_the_offline_is_still_found()
+    {
+        // The reason the ledger is shared: the state loop queues retained
+        // discovery and availability at QoS 1 too, so the driver alone cannot
+        // count what is ahead of the offline message.
+        let (client, _rx) = test_client(REQUEST_CHANNEL_CAPACITY);
+        let ledger = Qos1Ledger::default();
+        let config = test_config();
+
+        announce(&client, &ledger, &config, &BTreeSet::from([1]));
+        let mut publisher = BikePublisher::new(config, Arc::new(Mutex::new(BTreeSet::new())));
+        for message in publisher.observe(reading_from(2, 100)) {
+            try_send(&client, &ledger, &message);
+        }
+        publisher.tick(Instant::now(), |message| {
+            try_send(&client, &ledger, message)
+        });
+        // bridge availability + 1 config from announce, 1 config + 1
+        // availability from the state loop; the state publish is QoS 0.
+        for _ in 0..4 {
+            assert!(!ledger.is_offline_publish(true));
+        }
+        assert!(ledger.is_offline_publish(true));
+    }
+
+    #[test]
+    fn given_a_rejected_qos1_publish_when_sent_then_it_is_not_counted() {
+        let (client, _rx) = test_client(0);
+        let ledger = Qos1Ledger::default();
+        let message = OutgoingMessage::retained("t".into(), "p");
+
+        assert!(!try_send(&client, &ledger, &message));
+        assert!(ledger.is_offline_publish(true), "nothing is accounted for");
+    }
+
+    #[test]
+    fn given_the_messages_the_state_loop_sends_when_inspected_then_retained_ones_are_qos1() {
+        // Retained discovery and availability must survive a loss on the wire;
+        // state is superseded within seconds and stays QoS 0.
+        let mut publisher = publisher();
+        let discovery = publisher.observe(reading_from(BIKE, 150));
+        assert_eq!(discovery[0].qos, QoS::AtLeastOnce);
+        let sent = tick_all(&mut publisher);
+        assert_eq!(sent[0].qos, QoS::AtLeastOnce, "availability");
+        assert_eq!(sent[1].qos, QoS::AtMostOnce, "state");
+        assert!(
+            publisher
+                .offline_messages()
+                .iter()
+                .all(|m| m.qos == QoS::AtLeastOnce)
+        );
     }
 
     #[test]
