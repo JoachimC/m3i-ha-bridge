@@ -29,8 +29,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(EXPIRE_AFTER_SECS as u6
 ///
 /// So dedup is bounded by a heartbeat: an unchanged payload is republished once
 /// per [`HEARTBEAT_INTERVAL`]. Keeping `expire_after` rather than dropping it is
-/// the point — it still means what it says, "no state has arrived", which now
-/// only happens when the bridge really has stopped publishing.
+/// the point — it means what it says, "no state has arrived", which only
+/// happens when the bridge really has stopped publishing.
 struct PublishGate {
     last: Option<(String, Instant)>,
     heartbeat: Duration,
@@ -53,8 +53,6 @@ impl PublishGate {
         }
     }
 
-    /// Recorded only after a publish actually succeeds, so a rejected publish
-    /// is retried on the next tick rather than being deduplicated away.
     fn record_published(&mut self, payload: String, now: Instant) {
         self.last = Some((payload, now));
     }
@@ -397,11 +395,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_an_idle_bike_when_the_heartbeat_elapses_then_the_state_is_republished() {
-        // The defect in issue #3. Once sanitized() has zeroed the live metrics
-        // the payload stops changing, so dedup used to suppress every publish
-        // and Home Assistant marked all seven sensors unavailable after
-        // expire_after -- while the bridge was healthy and still reporting
-        // itself online.
+        // Once sanitized() has zeroed the live metrics the payload stops
+        // changing; without the heartbeat, dedup suppresses every publish and
+        // Home Assistant expires every sensor while the bridge is healthy and
+        // still reporting itself online.
         let mut gate = PublishGate::new(HEARTBEAT_INTERVAL);
         let idle = "{\"power\":0,\"cadence\":0.0}";
         gate.record_published(idle.to_string(), Instant::now());

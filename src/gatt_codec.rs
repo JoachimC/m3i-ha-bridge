@@ -125,17 +125,18 @@ pub fn initial_notification(
     has_value(&stats).then(|| serialize(&stats))
 }
 
-/// Whether Indoor Bike Data has anything worth reporting to a new subscriber.
+// Whether each characteristic has anything worth sending a new subscriber.
+// All three gate on a live metric, which is exactly what `sanitized` zeroes,
+// so staleness silences every one of them.
+
 pub fn ftms_has_value(stats: &Sanitized) -> bool {
     stats.power > 0 || stats.cadence.is_positive()
 }
 
-/// Whether Cycling Power Measurement has anything worth reporting.
 pub fn cps_has_value(stats: &Sanitized) -> bool {
     stats.power > 0
 }
 
-/// Whether Heart Rate Measurement has anything worth reporting.
 pub fn hrs_has_value(stats: &Sanitized) -> bool {
     stats.heart_rate.is_positive()
 }
@@ -345,10 +346,9 @@ mod tests {
 
     #[test]
     fn given_stale_stats_when_the_initial_notification_is_built_then_nothing_is_sent() {
-        // The defect in issue #4: the predicate used to see the raw watch
-        // value, so `power > 0` fired *precisely* when the reading was too old
-        // to send, and a client subscribing an hour after a ride was handed the
-        // last live power, cadence and heart rate.
+        // Evaluated on the raw reading, `power > 0` fires *precisely* when it
+        // is too old to send: a client subscribing an hour after a ride would
+        // be handed the last live power, cadence and heart rate.
         let mut serialize = serialize_ftms;
         assert!(initial_notification(&stale_reading(), ftms_has_value, &mut serialize).is_none());
     }

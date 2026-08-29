@@ -45,9 +45,8 @@ const STATE_PUBLISHES_IN_FLIGHT: usize = MAX_BIKES;
 /// Hard bound on the shutdown handshake: queue the retained `offline` message,
 /// wait for the broker to acknowledge it, then DISCONNECT.
 ///
-/// Well under systemd's default `TimeoutStopSec`, and it replaces an
-/// unconditional 700 ms delay — so an ordinary shutdown now takes one round
-/// trip rather than a fixed wait.
+/// Well under systemd's default `TimeoutStopSec`; an ordinary shutdown takes
+/// one round trip.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A message to send. Retained messages (discovery, availability) go out at
@@ -362,16 +361,15 @@ mod tests {
 
     #[test]
     fn given_the_request_channel_when_a_whole_announce_burst_arrives_then_none_is_dropped() {
-        // The defect in issue #12: announce runs inside the poll task, so the
-        // event loop is not draining while the burst is queued. With a channel
-        // this burst can overflow, a dropped retained discovery config stays
-        // missing until the next reconnect -- and try_publish only logs.
+        // announce runs inside the poll task, so the event loop is not
+        // draining while the burst is queued. If the burst overflowed the
+        // channel, a dropped retained discovery config would stay missing
+        // until the next reconnect -- and try_publish only logs.
         let topics = test_topics();
         let (client, rx) = test_client(REQUEST_CHANNEL_CAPACITY);
 
-        // The worst case: every ordinal id 0–200 has been heard. With per-bike
-        // devices (issue #6) the burst scales with the bikes in range, and the
-        // old capacity of 64 overflowed at four bikes.
+        // The worst case: every ordinal id 0–200 has been heard, and the burst
+        // scales with the bikes in range.
         let bikes: BTreeSet<BikeId> = (0..=200).map(BikeId).collect();
         assert_eq!(
             bikes.len(),
