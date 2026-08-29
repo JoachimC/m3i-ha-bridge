@@ -13,7 +13,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::BoxError;
-use crate::keiser::{KEISER_MANUFACTURER_ID, parse_keiser_data};
+use crate::keiser::{self, MANUFACTURER_ID};
 use crate::run_status::RunStatus;
 use crate::stats::{BikeId, Fleet, KeiserStats, Reading, record_reading};
 use std::sync::Arc;
@@ -114,15 +114,21 @@ fn keiser_stats_from(
     manufacturer_data: &HashMap<u16, Vec<u8>>,
     bike_id_filter: Option<BikeId>,
 ) -> Option<KeiserStats> {
-    let data = manufacturer_data.get(&KEISER_MANUFACTURER_ID)?;
+    let data = manufacturer_data.get(&MANUFACTURER_ID)?;
 
-    let Some(stats) = parse_keiser_data(data) else {
-        // parse_keiser_data already warns about old firmware and imperial
-        // units; this covers the length and data-slot rejections, which used
-        // to vanish silently. Debug level, so a malformed beacon arriving at
-        // 2 Hz cannot flood the journal.
-        tracing::debug!(payload = ?data, "unparseable Keiser advertisement");
-        return None;
+    let stats = match keiser::parse(data) {
+        Ok(stats) => stats,
+        // An unsupported bike is a persistent condition the operator needs
+        // to see, so it is a warning. A malformed or review-record beacon is
+        // one packet, and the bike sends those at 2 Hz: debug only.
+        Err(rejection) if rejection.is_unsupported_bike() => {
+            tracing::warn!("ignoring Keiser advertisement: {rejection}");
+            return None;
+        }
+        Err(rejection) => {
+            tracing::debug!(payload = ?data, "ignoring Keiser advertisement: {rejection}");
+            return None;
+        }
     };
 
     if let Some(wanted) = bike_id_filter
@@ -207,7 +213,7 @@ mod tests {
     #[tokio::test]
     async fn given_a_keiser_advertisement_when_the_bridge_runs_then_the_reading_is_published() {
         let scanner = FakeScanner::new(vec![ScanEvent::Advertisement(advertisement(
-            KEISER_MANUFACTURER_ID,
+            MANUFACTURER_ID,
             &LIVE_CAPTURE,
         ))]);
         let (stats_tx, stats_rx) = crate::stats::fleet_channel();
@@ -283,7 +289,7 @@ mod tests {
     #[tokio::test]
     async fn given_a_bike_id_filter_when_another_bike_advertises_then_the_bridge_ignores_it() {
         let scanner = FakeScanner::new(vec![ScanEvent::Advertisement(advertisement(
-            KEISER_MANUFACTURER_ID,
+            MANUFACTURER_ID,
             &capture_for_bike(9),
         ))]);
         let (stats_tx, stats_rx) = crate::stats::fleet_channel();
@@ -312,7 +318,7 @@ mod tests {
         // registry. Pinned because widening this back out is what issue #16 was
         // about: 0x0201 is AR Timing, 0x01AA Geophysical Technology, 0x015E
         // Unikey Technologies.
-        assert_eq!(KEISER_MANUFACTURER_ID, 0x0102);
+        assert_eq!(MANUFACTURER_ID, 0x0102);
     }
 
     #[tokio::test]
@@ -350,7 +356,7 @@ mod tests {
         // clock, and must not feed it.
         let (stats_tx, stats_rx) = crate::stats::fleet_channel();
         handle_advertisement(
-            &advertisement(KEISER_MANUFACTURER_ID, &LIVE_CAPTURE),
+            &advertisement(MANUFACTURER_ID, &LIVE_CAPTURE),
             &stats_tx,
             None,
         );
@@ -362,11 +368,8 @@ mod tests {
 
     #[test]
     fn given_a_keiser_advertisement_when_filtered_then_the_reading_is_returned() {
-        let stats = keiser_stats_from(
-            &manufacturer_data(KEISER_MANUFACTURER_ID, &LIVE_CAPTURE),
-            None,
-        )
-        .expect("a valid Keiser packet should parse");
+        let stats = keiser_stats_from(&manufacturer_data(MANUFACTURER_ID, &LIVE_CAPTURE), None)
+            .expect("a valid Keiser packet should parse");
         assert_eq!(stats.bike_id, BikeId(0));
         assert_eq!(stats.cadence, Tenths(820));
     }
@@ -394,17 +397,14 @@ mod tests {
     #[test]
     fn given_an_unparseable_keiser_payload_when_filtered_then_nothing_is_returned() {
         let truncated = &LIVE_CAPTURE[..10];
-        assert!(
-            keiser_stats_from(&manufacturer_data(KEISER_MANUFACTURER_ID, truncated), None)
-                .is_none()
-        );
+        assert!(keiser_stats_from(&manufacturer_data(MANUFACTURER_ID, truncated), None).is_none());
     }
 
     #[test]
     fn given_no_bike_id_filter_when_any_bike_advertises_then_it_is_accepted() {
         for bike_id in [0, 1, 200] {
             let data = capture_for_bike(bike_id);
-            let stats = keiser_stats_from(&manufacturer_data(KEISER_MANUFACTURER_ID, &data), None)
+            let stats = keiser_stats_from(&manufacturer_data(MANUFACTURER_ID, &data), None)
                 .expect("every bike is accepted when unfiltered");
             assert_eq!(stats.bike_id, BikeId(bike_id));
         }
@@ -413,11 +413,8 @@ mod tests {
     #[test]
     fn given_a_bike_id_filter_when_the_matching_bike_advertises_then_it_is_accepted() {
         let data = capture_for_bike(7);
-        let stats = keiser_stats_from(
-            &manufacturer_data(KEISER_MANUFACTURER_ID, &data),
-            Some(BikeId(7)),
-        )
-        .expect("the requested bike should be accepted");
+        let stats = keiser_stats_from(&manufacturer_data(MANUFACTURER_ID, &data), Some(BikeId(7)))
+            .expect("the requested bike should be accepted");
         assert_eq!(stats.bike_id, BikeId(7));
     }
 
@@ -425,11 +422,8 @@ mod tests {
     fn given_a_bike_id_filter_when_another_bike_advertises_then_it_is_ignored() {
         let data = capture_for_bike(9);
         assert!(
-            keiser_stats_from(
-                &manufacturer_data(KEISER_MANUFACTURER_ID, &data),
-                Some(BikeId(7))
-            )
-            .is_none()
+            keiser_stats_from(&manufacturer_data(MANUFACTURER_ID, &data), Some(BikeId(7)))
+                .is_none()
         );
     }
 
@@ -439,19 +433,13 @@ mod tests {
         // on 0 must filter, not mean "unset".
         let data = capture_for_bike(1);
         assert!(
-            keiser_stats_from(
-                &manufacturer_data(KEISER_MANUFACTURER_ID, &data),
-                Some(BikeId(0))
-            )
-            .is_none()
+            keiser_stats_from(&manufacturer_data(MANUFACTURER_ID, &data), Some(BikeId(0)))
+                .is_none()
         );
         let data = capture_for_bike(0);
         assert!(
-            keiser_stats_from(
-                &manufacturer_data(KEISER_MANUFACTURER_ID, &data),
-                Some(BikeId(0))
-            )
-            .is_some()
+            keiser_stats_from(&manufacturer_data(MANUFACTURER_ID, &data), Some(BikeId(0)))
+                .is_some()
         );
     }
 }

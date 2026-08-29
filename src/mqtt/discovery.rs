@@ -331,9 +331,8 @@ mod tests {
         // the symptom in issue #2 is a string Home Assistant renders verbatim:
         // cadence 502 -> 50.2 rpm and distance 1 -> 0.1 km used to serialize as
         // 50.20000076293945 and 0.10000000149011612.
-        let mut stats =
-            crate::keiser::parse_keiser_data(&hex!("0624ff00f60100001b0002000033018008"))
-                .expect("the captured packet should parse");
+        let mut stats = crate::keiser::parse(&hex!("0624ff00f60100001b0002000033018008"))
+            .expect("the captured packet should parse");
         stats.is_paused = false; // so sanitizing keeps the 50.2 rpm this test is about
         let payload = payload_of(stats).to_string();
 
