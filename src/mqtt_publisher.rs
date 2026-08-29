@@ -11,7 +11,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::stats::{Fleet, KeiserStats, bike_display_name, bike_id_label, next_snapshot};
+use crate::stats::{BikeId, Fleet, Sanitized, next_snapshot};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// Capacity of rumqttc's request channel — `AsyncClient::new`'s `cap` is
@@ -104,8 +104,8 @@ impl MqttConfig {
     }
 
     /// Where one bike's readings go: `<prefix>/<id>/state`.
-    pub fn state_topic(&self, bike_id: u8) -> String {
-        format!("{}/{}/state", self.topic_prefix, bike_id_label(bike_id))
+    pub fn state_topic(&self, bike_id: BikeId) -> String {
+        format!("{}/{bike_id}/state", self.topic_prefix)
     }
 
     /// Whether the *bridge* is running: the last will lives here, so a crash
@@ -117,20 +117,16 @@ impl MqttConfig {
     /// Whether one *bike* is being heard: `offline` once its readings go
     /// stale, so a bike that has been switched off greys out in Home Assistant
     /// while the bridge, and the other bikes, stay online.
-    pub fn bike_availability_topic(&self, bike_id: u8) -> String {
-        format!(
-            "{}/{}/availability",
-            self.topic_prefix,
-            bike_id_label(bike_id)
-        )
+    pub fn bike_availability_topic(&self, bike_id: BikeId) -> String {
+        format!("{}/{bike_id}/availability", self.topic_prefix)
     }
 
     /// Node id used in Home Assistant discovery topics; must not contain '/'.
     ///
     /// Deliberately independent of the topic prefix: the same physical bike
     /// heard by two bridges on one broker is one device, not two.
-    fn node_id(bike_id: u8) -> String {
-        format!("m3i-ha-bridge-{}", bike_id_label(bike_id))
+    fn node_id(bike_id: BikeId) -> String {
+        format!("m3i-ha-bridge-{bike_id}")
     }
 }
 
@@ -227,7 +223,7 @@ struct BikeChannel {
 /// broker.
 pub struct BikePublisher {
     config: MqttConfig,
-    bikes: BTreeMap<u8, BikeChannel>,
+    bikes: BTreeMap<BikeId, BikeChannel>,
 }
 
 impl BikePublisher {
@@ -241,7 +237,7 @@ impl BikePublisher {
     /// Announces any bike in `fleet` seen for the first time, so its device
     /// exists before its first state arrives.
     fn observe(&mut self, fleet: &Fleet) -> Vec<OutgoingMessage> {
-        let new_bikes: Vec<u8> = fleet
+        let new_bikes: Vec<BikeId> = fleet
             .keys()
             .filter(|bike_id| !self.bikes.contains_key(bike_id))
             .copied()
@@ -620,7 +616,7 @@ async fn drive_connection(
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::ConnAck(_))) if !cancel_token.is_cancelled() => {
                 tracing::info!("Connected to MQTT broker");
-                let bikes: BTreeSet<u8> = fleet_rx.borrow().keys().copied().collect();
+                let bikes: BTreeSet<BikeId> = fleet_rx.borrow().keys().copied().collect();
                 announce(&client, &ledger, &config, &bikes);
                 connected.send_modify(|generation| *generation += 1);
             }
@@ -709,7 +705,7 @@ fn announce(
     client: &AsyncClient,
     ledger: &Qos1Ledger,
     config: &MqttConfig,
-    bikes: &BTreeSet<u8>,
+    bikes: &BTreeSet<BikeId>,
 ) -> usize {
     let mut messages = vec![OutgoingMessage::retained(
         config.bridge_availability_topic(),
@@ -734,34 +730,15 @@ fn announce(
     queued
 }
 
-/// Rounds to the bike's native resolution of 0.1, which is also what makes the
-/// value print cleanly.
-///
-/// `KeiserStats` holds cadence, heart rate and distance as `f32` because the
-/// packet carries them as `value * 10` in a `u16`. `serde_json` widens an `f32`
-/// to `f64` and then prints the shortest string that round-trips the *`f64`*,
-/// which re-exposes the binary approximation: the real capture's 50.2 rpm
-/// becomes `50.20000076293945` and 0.1 km becomes `0.10000000149011612`. Home
-/// Assistant renders the state string verbatim, so that noise reaches the
-/// dashboard.
-///
-/// Rounding here rather than setting the discovery payload's
-/// `suggested_display_precision` is deliberate: that only affects how Home
-/// Assistant displays a value, leaving the raw state, templates and automations
-/// to deal with the noise.
-fn round_to_native_resolution(value: f32) -> f64 {
-    (value as f64 * 10.0).round() / 10.0
-}
-
-fn state_payload(stats: &KeiserStats) -> serde_json::Value {
+fn state_payload(stats: &Sanitized) -> serde_json::Value {
     json!({
-        "bike_id": stats.bike_id,
-        "version": stats.version,
+        "bike_id": stats.bike_id.0,
+        "version": stats.version.to_string(),
         "power": stats.power,
-        "cadence": round_to_native_resolution(stats.cadence),
-        "heart_rate": round_to_native_resolution(stats.heart_rate),
+        "cadence": stats.cadence.as_f64(),
+        "heart_rate": stats.heart_rate.as_f64(),
         "gear": stats.gear,
-        "distance": round_to_native_resolution(stats.distance),
+        "distance": stats.distance.as_f64(),
         "distance_unit": "Km",
         "energy": stats.energy,
         "energy_unit": "KCal",
@@ -938,11 +915,11 @@ const SENSORS: &[SensorSpec] = &[
 /// discovery schema uses `extra=vol.REMOVE_EXTRA`, so the key is silently
 /// discarded. Adding it would look like it did something while changing
 /// nothing.
-fn discovery_message(config: &MqttConfig, bike_id: u8) -> (String, serde_json::Value) {
+fn discovery_message(config: &MqttConfig, bike_id: BikeId) -> (String, serde_json::Value) {
     let node_id = MqttConfig::node_id(bike_id);
     let device = json!({
-        "identifiers": [format!("m3i_ha_bridge_{}", bike_id_label(bike_id))],
-        "name": bike_display_name(bike_id),
+        "identifiers": [format!("m3i_ha_bridge_{bike_id}")],
+        "name": bike_id.display_name(),
         "manufacturer": "Keiser",
         "model": "M3i",
     });
@@ -1019,7 +996,7 @@ fn discovery_message(config: &MqttConfig, bike_id: u8) -> (String, serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stats::Reading;
+    use crate::stats::{KeiserStats, Reading, Tenths};
     use hex_literal::hex;
     use std::collections::HashMap;
 
@@ -1086,13 +1063,13 @@ mod tests {
         assert_eq!(config.username.as_deref(), Some("ha"));
         assert_eq!(config.password.as_deref(), Some("secret"));
         assert_eq!(config.client_id, "bike-bridge");
-        assert_eq!(config.state_topic(42), "fitness/m3i/042/state");
+        assert_eq!(config.state_topic(BikeId(42)), "fitness/m3i/042/state");
         assert_eq!(
             config.bridge_availability_topic(),
             "fitness/m3i/availability"
         );
         assert_eq!(
-            config.bike_availability_topic(42),
+            config.bike_availability_topic(BikeId(42)),
             "fitness/m3i/042/availability"
         );
     }
@@ -1220,22 +1197,25 @@ mod tests {
         assert_eq!(config_from(&vars, &HashMap::new()), None);
     }
 
+    fn payload_of(stats: KeiserStats) -> serde_json::Value {
+        state_payload(&Reading::now(stats).sanitized())
+    }
+
     #[test]
     fn given_stats_when_state_payload_is_built_then_all_fields_are_present() {
-        let stats = KeiserStats {
-            bike_id: 3,
+        let payload = payload_of(KeiserStats {
+            bike_id: BikeId(3),
             power: 150,
-            cadence: 85.5,
-            heart_rate: 120.0,
+            cadence: Tenths(855),
+            heart_rate: Tenths(1200),
             gear: 12,
-            distance: 4.2,
+            distance: Tenths(42),
             energy: 55,
             minutes: 2,
             seconds: 5,
             is_paused: false,
             ..Default::default()
-        };
-        let payload = state_payload(&stats);
+        });
         assert_eq!(payload["bike_id"], 3);
         assert_eq!(payload["power"], 150);
         assert_eq!(payload["gear"], 12);
@@ -1251,9 +1231,11 @@ mod tests {
         // the symptom in issue #2 is a string Home Assistant renders verbatim:
         // cadence 502 -> 50.2 rpm and distance 1 -> 0.1 km used to serialize as
         // 50.20000076293945 and 0.10000000149011612.
-        let stats = crate::keiser::parse_keiser_data(&hex!("0624ff00f60100001b0002000033018008"))
-            .expect("the captured packet should parse");
-        let payload = state_payload(&stats).to_string();
+        let mut stats =
+            crate::keiser::parse_keiser_data(&hex!("0624ff00f60100001b0002000033018008"))
+                .expect("the captured packet should parse");
+        stats.is_paused = false; // so sanitizing keeps the 50.2 rpm this test is about
+        let payload = payload_of(stats).to_string();
 
         assert!(
             payload.contains("\"cadence\":50.2"),
@@ -1271,41 +1253,15 @@ mod tests {
 
     #[test]
     fn given_a_heart_rate_when_the_state_payload_is_built_then_it_is_rounded_too() {
-        let stats = KeiserStats {
-            heart_rate: 1205.0 / 10.0,
+        let payload = payload_of(KeiserStats {
+            heart_rate: Tenths(1205),
             ..Default::default()
-        };
-        assert!(
-            state_payload(&stats)
-                .to_string()
-                .contains("\"heart_rate\":120.5")
-        );
-    }
-
-    #[test]
-    fn given_values_at_the_bikes_resolution_when_rounded_then_they_are_preserved_exactly() {
-        // The bike transmits `value * 10` in a u16, so every representable
-        // reading is a multiple of 0.1. Rounding must not move any of them.
-        for raw in [0u16, 1, 5, 502, 820, 1205, 65535] {
-            let native = raw as f32 / 10.0;
-            assert_eq!(
-                round_to_native_resolution(native),
-                raw as f64 / 10.0,
-                "raw {raw} should round-trip through 0.1 resolution"
-            );
-        }
-    }
-
-    #[test]
-    fn given_a_zeroed_reading_when_rounded_then_it_stays_zero() {
-        // sanitized() zeroes the live metrics, and both -0.0 and 1e-9 would
-        // print oddly in Home Assistant.
-        assert_eq!(round_to_native_resolution(0.0), 0.0);
-        assert_eq!(round_to_native_resolution(0.0).to_string(), "0");
+        });
+        assert!(payload.to_string().contains("\"heart_rate\":120.5"));
     }
 
     /// The bike every discovery test announces.
-    const BIKE: u8 = 42;
+    const BIKE: BikeId = BikeId(42);
 
     #[test]
     fn given_config_when_the_discovery_message_is_built_then_it_is_one_device_topic_per_bike() {
@@ -1391,7 +1347,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            state_payload(&stats)["bike_id"],
+            payload_of(stats)["bike_id"],
             json!(42),
             "the console shows 42, not \"042\""
         );
@@ -1425,16 +1381,16 @@ mod tests {
             .unwrap_or_else(|| panic!("no discovery component for {object_id}"))
     }
 
-    fn reading_from(bike_id: u8, power: u16) -> Reading {
+    fn reading_from(bike_id: impl Into<BikeId>, power: u16) -> Reading {
         Reading::now(KeiserStats {
-            bike_id,
+            bike_id: bike_id.into(),
             power,
-            cadence: 80.0,
+            cadence: Tenths(800),
             ..Default::default()
         })
     }
 
-    fn stale_reading_from(bike_id: u8, power: u16) -> Reading {
+    fn stale_reading_from(bike_id: impl Into<BikeId>, power: u16) -> Reading {
         Reading {
             received_at: std::time::Instant::now() - crate::stats::STALE_AFTER * 2,
             ..reading_from(bike_id, power)
@@ -1679,7 +1635,7 @@ mod tests {
         // The worst case: every ordinal id 0–200 has been heard. With per-bike
         // devices (issue #6) the burst scales with the bikes in range, and the
         // old capacity of 64 overflowed at four bikes.
-        let bikes: BTreeSet<u8> = (0..=200).collect();
+        let bikes: BTreeSet<BikeId> = (0..=200).map(BikeId).collect();
         assert_eq!(
             bikes.len(),
             MAX_BIKES,
@@ -1712,7 +1668,7 @@ mod tests {
                 &client,
                 &Qos1Ledger::default(),
                 &config,
-                &BTreeSet::from([1, 2, 3, 4])
+                &BTreeSet::from([BikeId(1), BikeId(2), BikeId(3), BikeId(4)])
             ),
             3,
             "only what fits is queued"
@@ -1836,7 +1792,7 @@ mod tests {
         let ledger = Qos1Ledger::default();
         let config = test_config();
 
-        announce(&client, &ledger, &config, &BTreeSet::from([1]));
+        announce(&client, &ledger, &config, &BTreeSet::from([BikeId(1)]));
         let mut publisher = BikePublisher::new(config);
         let fleet = fleet_of([reading_from(2, 100)]);
         for message in publisher.observe(&fleet) {
@@ -2184,7 +2140,7 @@ mod tests {
         // The discovery configs and the state payload are edited in different
         // places, so this checks the JSON key each value_template reads is
         // actually published.
-        let payload = state_payload(&KeiserStats::default());
+        let payload = payload_of(KeiserStats::default());
 
         for spec in SENSORS {
             let field = spec

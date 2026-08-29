@@ -11,19 +11,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::stats::{Fleet, KeiserStats, Reading, bike_display_name, bike_id_label};
-
-/// Name the bridge advertises itself under: the bike's display name, so a
-/// pairing screen in Zwift or Garmin shows which bike this is.
-pub fn local_name(bike_id: u8) -> String {
-    bike_display_name(bike_id)
-}
-
-/// The Device Information Service's Serial Number String for a bike: the
-/// zero-padded id, or empty while no bike has been heard.
-pub fn serial_number(bike_id: Option<u8>) -> String {
-    bike_id.map(bike_id_label).unwrap_or_default()
-}
+use crate::stats::{BikeId, Fleet, Sanitized};
 
 /// How long the latest bike id has to stay the same before the advertisement
 /// is re-registered under it.
@@ -49,20 +37,20 @@ pub const CANDIDATE_RECENCY: Duration = Duration::from_secs(5);
 /// than one that sent a stray packet.
 #[derive(Debug, Default)]
 pub struct AdvertisedIdTracker {
-    advertised: Option<u8>,
+    advertised: Option<BikeId>,
     candidate: Option<Candidate>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Candidate {
-    bike_id: u8,
+    bike_id: BikeId,
     first_seen: Instant,
     last_seen: Instant,
 }
 
 impl AdvertisedIdTracker {
     /// Records a sighting of a bike.
-    pub fn observe(&mut self, bike_id: u8, now: Instant) {
+    pub fn observe(&mut self, bike_id: BikeId, now: Instant) {
         if self.advertised == Some(bike_id) {
             self.candidate = None;
             return;
@@ -81,7 +69,7 @@ impl AdvertisedIdTracker {
 
     /// The id the advertisement should switch to now, if any. Calling this
     /// commits the switch, so the caller must go on to register it.
-    pub fn take_due(&mut self, now: Instant) -> Option<u8> {
+    pub fn take_due(&mut self, now: Instant) -> Option<BikeId> {
         let candidate = self.candidate?;
         let due = self.advertised.is_none()
             || (now.duration_since(candidate.first_seen) >= ADVERTISED_ID_HOLD
@@ -95,7 +83,7 @@ impl AdvertisedIdTracker {
     }
 
     #[cfg(test)]
-    pub fn advertised(&self) -> Option<u8> {
+    pub fn advertised(&self) -> Option<BikeId> {
         self.advertised
     }
 }
@@ -111,12 +99,12 @@ impl AdvertisedIdTracker {
 /// sighted only when its reading's receive timestamp has changed.
 #[derive(Debug, Default)]
 pub struct NewArrivals {
-    seen: BTreeMap<u8, std::time::Instant>,
+    seen: BTreeMap<BikeId, std::time::Instant>,
 }
 
 impl NewArrivals {
     /// The bikes whose reading in `fleet` has not been seen before.
-    pub fn new_in(&mut self, fleet: &Fleet) -> Vec<u8> {
+    pub fn new_in(&mut self, fleet: &Fleet) -> Vec<BikeId> {
         fleet
             .iter()
             .filter(|(bike_id, reading)| {
@@ -175,7 +163,7 @@ pub const FTMS_FEATURE_VALUE: [u8; 8] = [0x86, 0x54, 0x00, 0x00, 0x00, 0x00, 0x0
 /// Flags 0x0A74: Cadence (bit 2), Total Distance (bit 4), Resistance (bit 5),
 /// Power (bit 6), Heart Rate (bit 9) and Elapsed Time (bit 11) present.
 /// Bit 0 ("More Data") clear means Instantaneous Speed is also present.
-pub fn serialize_ftms(stats: &KeiserStats) -> Vec<u8> {
+pub fn serialize_ftms(stats: &Sanitized) -> Vec<u8> {
     let flags: u16 = 0x0A74;
     let mut data = Vec::with_capacity(16);
     data.extend_from_slice(&flags.to_le_bytes());
@@ -185,11 +173,11 @@ pub fn serialize_ftms(stats: &KeiserStats) -> Vec<u8> {
     data.extend_from_slice(&speed_u16.to_le_bytes());
 
     // Instantaneous Cadence: u16, 0.5 RPM
-    let cadence_u16 = (stats.cadence * 2.0) as u16;
-    data.extend_from_slice(&cadence_u16.to_le_bytes());
+    let cadence_half_rpm = stats.cadence.0 / 5;
+    data.extend_from_slice(&cadence_half_rpm.to_le_bytes());
 
-    // Total Distance: u24, meters (stats.distance is km)
-    let distance_m = (stats.distance * 1000.0) as u32;
+    // Total Distance: u24, meters (stats.distance is tenths of a km)
+    let distance_m = u32::from(stats.distance.0) * 100;
     data.extend_from_slice(&distance_m.to_le_bytes()[0..3]);
 
     // Resistance Level: i16 (the M3i's gear)
@@ -199,7 +187,7 @@ pub fn serialize_ftms(stats: &KeiserStats) -> Vec<u8> {
     data.extend_from_slice(&(stats.power as i16).to_le_bytes());
 
     // Heart Rate: u8, BPM
-    data.push(stats.heart_rate as u8);
+    data.push(stats.heart_rate.whole() as u8);
 
     // Elapsed Time: u16, seconds
     data.extend_from_slice(&stats.elapsed_seconds().to_le_bytes());
@@ -211,7 +199,7 @@ pub fn serialize_ftms(stats: &KeiserStats) -> Vec<u8> {
 ///
 /// Flags 0x0020: Crank Revolution Data present; Instantaneous Power is always
 /// present per the spec.
-pub fn serialize_cps(stats: &KeiserStats, revolutions: u16, event_time: u16) -> Vec<u8> {
+pub fn serialize_cps(stats: &Sanitized, revolutions: u16, event_time: u16) -> Vec<u8> {
     let flags: u16 = 0x0020;
     let mut data = Vec::with_capacity(8);
     data.extend_from_slice(&flags.to_le_bytes());
@@ -229,8 +217,8 @@ pub fn serialize_cps(stats: &KeiserStats, revolutions: u16, event_time: u16) -> 
 }
 
 /// Heart Rate Measurement (0x2A37). Flags 0x00: u8 value, no extra fields.
-pub fn serialize_hrs(stats: &KeiserStats) -> Vec<u8> {
-    vec![0x00, stats.heart_rate as u8]
+pub fn serialize_hrs(stats: &Sanitized) -> Vec<u8> {
+    vec![0x00, stats.heart_rate.whole() as u8]
 }
 
 /// The first payload to send a client that has just subscribed to a notify
@@ -247,27 +235,27 @@ pub fn serialize_hrs(stats: &KeiserStats) -> Vec<u8> {
 /// `serialize` is therefore only invoked when something is actually being sent,
 /// which keeps the stateful CPS serializer from advancing on a skipped send.
 pub fn initial_notification(
-    reading: &Reading,
-    has_value: fn(&KeiserStats) -> bool,
-    serialize: &mut impl FnMut(&KeiserStats) -> Vec<u8>,
+    reading: &crate::stats::Reading,
+    has_value: fn(&Sanitized) -> bool,
+    serialize: &mut impl FnMut(&Sanitized) -> Vec<u8>,
 ) -> Option<Vec<u8>> {
     let stats = reading.sanitized();
     has_value(&stats).then(|| serialize(&stats))
 }
 
 /// Whether Indoor Bike Data has anything worth reporting to a new subscriber.
-pub fn ftms_has_value(stats: &KeiserStats) -> bool {
-    stats.power > 0 || stats.cadence > 0.0
+pub fn ftms_has_value(stats: &Sanitized) -> bool {
+    stats.power > 0 || stats.cadence.is_positive()
 }
 
 /// Whether Cycling Power Measurement has anything worth reporting.
-pub fn cps_has_value(stats: &KeiserStats) -> bool {
+pub fn cps_has_value(stats: &Sanitized) -> bool {
     stats.power > 0
 }
 
 /// Whether Heart Rate Measurement has anything worth reporting.
-pub fn hrs_has_value(stats: &KeiserStats) -> bool {
-    stats.heart_rate > 0.0
+pub fn hrs_has_value(stats: &Sanitized) -> bool {
+    stats.heart_rate.is_positive()
 }
 
 /// Converts an accumulating counter to the wrapping u16 the CPS spec expects.
@@ -291,13 +279,14 @@ pub fn calculate_speed_from_power(power: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stats::{KeiserStats, Reading, Tenths};
 
     fn stats() -> KeiserStats {
         KeiserStats {
             power: 150,
-            cadence: 85.0,
-            heart_rate: 120.0,
-            distance: 4.5,
+            cadence: Tenths(850),
+            heart_rate: Tenths(1200),
+            distance: Tenths(45),
             gear: 12,
             minutes: 2,
             seconds: 5,
@@ -309,13 +298,17 @@ mod tests {
         Reading::now(stats())
     }
 
+    fn sanitized() -> Sanitized {
+        reading().sanitized()
+    }
+
     fn le_u16(data: &[u8], offset: usize) -> u16 {
         u16::from_le_bytes([data[offset], data[offset + 1]])
     }
 
     #[test]
     fn given_stats_when_ftms_is_serialized_then_layout_matches_the_spec() {
-        let data = serialize_ftms(&stats());
+        let data = serialize_ftms(&sanitized());
         assert_eq!(data.len(), 16);
         assert_eq!(le_u16(&data, 0), 0x0A74, "flags");
         assert!(le_u16(&data, 2) > 0, "speed should be non-zero at 150W");
@@ -329,18 +322,11 @@ mod tests {
     }
 
     #[test]
-    fn given_a_bike_id_when_the_local_name_is_built_then_it_is_the_bikes_display_name() {
-        // Issue #6: the one place a rider can tell bikes apart in a pairing
-        // list is the advertised name, so it carries the padded id.
-        assert_eq!(local_name(42), "Keiser M3i #042");
-    }
-
-    #[test]
     fn given_the_advertised_services_when_sized_then_the_payload_fits_a_legacy_advertisement() {
         // Flags (3) + "Keiser M3i #200" (2 + 15) + three 16-bit UUIDs (2 + 6)
         // = 28: Cycling Power, Fitness Machine and, since issue #4, Heart
         // Rate. The widest id is three digits, so 200 is the worst case.
-        let size = legacy_advertising_size(&local_name(200), 3);
+        let size = legacy_advertising_size(&BikeId(200).display_name(), 3);
         assert_eq!(size, 28);
         assert!(
             size <= LEGACY_ADVERTISING_CAPACITY,
@@ -353,12 +339,14 @@ mod tests {
     fn given_a_fourth_advertised_service_when_sized_then_there_is_still_headroom() {
         // Nothing else is advertised today, but knowing one more would fit is
         // what makes that a choice rather than a constraint.
-        assert!(legacy_advertising_size(&local_name(200), 4) <= LEGACY_ADVERTISING_CAPACITY);
+        assert!(
+            legacy_advertising_size(&BikeId(200).display_name(), 4) <= LEGACY_ADVERTISING_CAPACITY
+        );
     }
 
     fn reading_from(bike_id: u8, power: u16) -> Reading {
         Reading::now(KeiserStats {
-            bike_id,
+            bike_id: BikeId(bike_id),
             power,
             ..stats()
         })
@@ -383,7 +371,7 @@ mod tests {
         // as bike 7 being present for ten seconds.
         let mut arrivals = NewArrivals::default();
         let fleet = fleet_of([reading_from(7, 50)]);
-        assert_eq!(arrivals.new_in(&fleet), [7]);
+        assert_eq!(arrivals.new_in(&fleet), [BikeId(7)]);
         assert!(arrivals.new_in(&fleet).is_empty());
         assert!(arrivals.new_in(&fleet).is_empty());
     }
@@ -395,14 +383,17 @@ mod tests {
         let bike_7 = reading_from(7, 50);
         assert_eq!(
             arrivals.new_in(&fleet_of([bike_42.clone(), bike_7.clone()])),
-            [7, 42]
+            [BikeId(7), BikeId(42)]
         );
 
         let bike_42_again = Reading {
             received_at: std::time::Instant::now() + Duration::from_secs(2),
             ..reading_from(42, 160)
         };
-        assert_eq!(arrivals.new_in(&fleet_of([bike_42_again, bike_7])), [42]);
+        assert_eq!(
+            arrivals.new_in(&fleet_of([bike_42_again, bike_7])),
+            [BikeId(42)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -427,13 +418,7 @@ mod tests {
             tokio::time::advance(Duration::from_secs(1)).await;
             assert_eq!(tracker.take_due(Instant::now()), None);
         }
-        assert_eq!(tracker.advertised(), Some(42));
-    }
-
-    #[test]
-    fn given_no_bike_heard_when_the_serial_number_is_read_then_it_is_empty() {
-        assert_eq!(serial_number(None), "");
-        assert_eq!(serial_number(Some(7)), "007");
+        assert_eq!(tracker.advertised(), Some(BikeId(42)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -442,9 +427,9 @@ mod tests {
         // protect from thrashing: the first id goes out immediately.
         let mut tracker = AdvertisedIdTracker::default();
         let now = Instant::now();
-        tracker.observe(42, now);
-        assert_eq!(tracker.take_due(now), Some(42));
-        assert_eq!(tracker.advertised(), Some(42));
+        tracker.observe(BikeId(42), now);
+        assert_eq!(tracker.take_due(now), Some(BikeId(42)));
+        assert_eq!(tracker.advertised(), Some(BikeId(42)));
         assert_eq!(tracker.take_due(now), None, "committed, not repeated");
     }
 
@@ -452,10 +437,10 @@ mod tests {
     async fn given_a_different_bike_when_it_has_only_just_appeared_then_nothing_is_due() {
         let mut tracker = AdvertisedIdTracker::default();
         let start = Instant::now();
-        tracker.observe(1, start);
+        tracker.observe(BikeId(1), start);
         tracker.take_due(start);
 
-        tracker.observe(2, start);
+        tracker.observe(BikeId(2), start);
         assert_eq!(tracker.take_due(start), None);
         tokio::time::advance(ADVERTISED_ID_HOLD / 2).await;
         assert_eq!(tracker.take_due(Instant::now()), None);
@@ -465,14 +450,14 @@ mod tests {
     async fn given_a_different_bike_when_it_has_persisted_for_the_hold_then_it_is_due() {
         let mut tracker = AdvertisedIdTracker::default();
         let start = Instant::now();
-        tracker.observe(1, start);
+        tracker.observe(BikeId(1), start);
         tracker.take_due(start);
 
-        tracker.observe(2, start);
+        tracker.observe(BikeId(2), start);
         tokio::time::advance(ADVERTISED_ID_HOLD).await;
-        tracker.observe(2, Instant::now());
-        assert_eq!(tracker.take_due(Instant::now()), Some(2));
-        assert_eq!(tracker.advertised(), Some(2));
+        tracker.observe(BikeId(2), Instant::now());
+        assert_eq!(tracker.take_due(Instant::now()), Some(BikeId(2)));
+        assert_eq!(tracker.advertised(), Some(BikeId(2)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -481,13 +466,13 @@ mod tests {
         // whole hold, but it has not taken over — the rider on bike 1 is just
         // coasting.
         let mut tracker = AdvertisedIdTracker::default();
-        tracker.observe(1, Instant::now());
+        tracker.observe(BikeId(1), Instant::now());
         tracker.take_due(Instant::now());
 
-        tracker.observe(7, Instant::now());
+        tracker.observe(BikeId(7), Instant::now());
         tokio::time::advance(ADVERTISED_ID_HOLD + Duration::from_secs(1)).await;
         assert_eq!(tracker.take_due(Instant::now()), None);
-        assert_eq!(tracker.advertised(), Some(1));
+        assert_eq!(tracker.advertised(), Some(BikeId(1)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -495,14 +480,14 @@ mod tests {
         // The genuine switch: bike 7 keeps advertising every 2 s while bike 1
         // is silent.
         let mut tracker = AdvertisedIdTracker::default();
-        tracker.observe(1, Instant::now());
+        tracker.observe(BikeId(1), Instant::now());
         tracker.take_due(Instant::now());
 
         for _ in 0..6 {
-            tracker.observe(7, Instant::now());
+            tracker.observe(BikeId(7), Instant::now());
             tokio::time::advance(Duration::from_secs(2)).await;
         }
-        assert_eq!(tracker.take_due(Instant::now()), Some(7));
+        assert_eq!(tracker.take_due(Instant::now()), Some(BikeId(7)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -511,18 +496,18 @@ mod tests {
         // couple of seconds. Bike 2 never holds the "latest" slot for the full
         // hold, so the advertisement stays on bike 1 rather than thrashing.
         let mut tracker = AdvertisedIdTracker::default();
-        tracker.observe(1, Instant::now());
+        tracker.observe(BikeId(1), Instant::now());
         tracker.take_due(Instant::now());
 
         for _ in 0..10 {
-            tracker.observe(2, Instant::now());
+            tracker.observe(BikeId(2), Instant::now());
             tokio::time::advance(Duration::from_secs(2)).await;
             assert_eq!(tracker.take_due(Instant::now()), None);
-            tracker.observe(1, Instant::now());
+            tracker.observe(BikeId(1), Instant::now());
             tokio::time::advance(Duration::from_secs(2)).await;
             assert_eq!(tracker.take_due(Instant::now()), None);
         }
-        assert_eq!(tracker.advertised(), Some(1));
+        assert_eq!(tracker.advertised(), Some(BikeId(1)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -530,14 +515,14 @@ mod tests {
         // Seeing the advertised bike again resets the clock: the next time a
         // different bike appears it has to earn the full hold from scratch.
         let mut tracker = AdvertisedIdTracker::default();
-        tracker.observe(1, Instant::now());
+        tracker.observe(BikeId(1), Instant::now());
         tracker.take_due(Instant::now());
 
-        tracker.observe(2, Instant::now());
+        tracker.observe(BikeId(2), Instant::now());
         tokio::time::advance(ADVERTISED_ID_HOLD - Duration::from_secs(1)).await;
-        tracker.observe(1, Instant::now());
+        tracker.observe(BikeId(1), Instant::now());
         tokio::time::advance(Duration::from_secs(2)).await;
-        tracker.observe(2, Instant::now());
+        tracker.observe(BikeId(2), Instant::now());
         assert_eq!(
             tracker.take_due(Instant::now()),
             None,
@@ -557,7 +542,7 @@ mod tests {
     fn given_no_advertised_services_when_sized_then_the_uuid_structure_costs_nothing() {
         // An empty AD structure is omitted entirely rather than emitted with a
         // zero-length value.
-        assert_eq!(legacy_advertising_size(&local_name(200), 0), 20);
+        assert_eq!(legacy_advertising_size(&BikeId(200).display_name(), 0), 20);
     }
 
     #[test]
@@ -595,7 +580,7 @@ mod tests {
         // restated as a literal, so the two can never drift apart: adding a
         // field to serialize_ftms without declaring it fails here, and so does
         // declaring a feature that is never sent.
-        let data = serialize_ftms(&stats());
+        let data = serialize_ftms(&sanitized());
         let flags = le_u16(&data, 0) as u32;
         let required = FLAG_TO_FEATURE
             .iter()
@@ -611,7 +596,7 @@ mod tests {
 
     #[test]
     fn given_stats_when_cps_is_serialized_then_layout_matches_the_spec() {
-        let data = serialize_cps(&stats(), 1234, 5678);
+        let data = serialize_cps(&sanitized(), 1234, 5678);
         assert_eq!(data.len(), 8);
         assert_eq!(le_u16(&data, 0), 0x0020, "flags");
         assert_eq!(le_u16(&data, 2), 150, "power");
@@ -621,7 +606,7 @@ mod tests {
 
     #[test]
     fn given_stats_when_hrs_is_serialized_then_layout_matches_the_spec() {
-        let data = serialize_hrs(&stats());
+        let data = serialize_hrs(&sanitized());
         assert_eq!(data, vec![0x00, 120]);
     }
 
@@ -670,7 +655,7 @@ mod tests {
         // send would advance cumulative crank revolutions across the whole idle
         // gap, so the decision has to come before serialization, not after.
         let mut calls = 0;
-        let mut serialize = |stats: &KeiserStats| {
+        let mut serialize = |stats: &Sanitized| {
             calls += 1;
             serialize_cps(stats, 0, 0)
         };

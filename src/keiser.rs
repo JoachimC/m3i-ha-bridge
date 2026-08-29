@@ -8,7 +8,7 @@
 //! Only new firmware (6.21+, 17-byte payload) and metric units are supported;
 //! anything else is logged and ignored.
 
-use crate::stats::KeiserStats;
+use crate::stats::{BikeId, KeiserStats, Tenths, Version};
 
 /// Keiser Corporation's Bluetooth SIG assigned company identifier — the only
 /// id an M3i advertises under.
@@ -31,10 +31,10 @@ pub const KEISER_MANUFACTURER_ID: u16 = 0x0102;
 /// format, so in a multi-bike room they all race on the same watch channel and
 /// the last writer wins. Note that `0` is a real bike id (it is the deployed
 /// bike's), so "unset" has to be `None` rather than zero.
-pub fn bike_id_filter(lookup: impl Fn(&str) -> Option<String>) -> Option<u8> {
+pub fn bike_id_filter(lookup: impl Fn(&str) -> Option<String>) -> Option<BikeId> {
     let raw = lookup("KEISER_BIKE_ID").filter(|v| !v.is_empty())?;
     match raw.parse() {
-        Ok(bike_id) => Some(bike_id),
+        Ok(bike_id) => Some(BikeId(bike_id)),
         Err(_) => {
             tracing::warn!("ignoring invalid KEISER_BIKE_ID {raw:?}; accepting every bike");
             None
@@ -127,13 +127,13 @@ pub fn parse_keiser_data(data: &[u8]) -> Option<KeiserStats> {
     }
 
     Some(KeiserStats {
-        bike_id: data[3],
-        version: format!("{major:02}.{minor:02}"),
+        bike_id: BikeId(data[3]),
+        version: Version { major, minor },
         power: le_u16(8),
-        cadence: le_u16(4) as f32 / 10.0,
-        heart_rate: le_u16(6) as f32 / 10.0,
+        cadence: Tenths(le_u16(4)),
+        heart_rate: Tenths(le_u16(6)),
         is_paused: data_slot == PAUSED_DATA_SLOT,
-        distance: (dist_raw & 0x7FFF) as f32 / 10.0,
+        distance: Tenths(dist_raw & 0x7FFF),
         energy: le_u16(10),
         minutes: data[12],
         seconds: data[13],
@@ -156,15 +156,15 @@ mod tests {
     fn given_real_paused_capture_when_parsed_then_all_fields_are_decoded() {
         let stats = parse_keiser_data(&PAUSED_CAPTURE).unwrap();
         assert!(stats.is_paused);
-        assert_eq!(stats.version, "06.24");
-        assert_eq!(stats.bike_id, 0);
-        assert_eq!(stats.cadence, 50.2);
-        assert_eq!(stats.heart_rate, 0.0);
+        assert_eq!(stats.version.to_string(), "06.24");
+        assert_eq!(stats.bike_id, BikeId(0));
+        assert_eq!(stats.cadence, Tenths(502), "50.2 rpm");
+        assert_eq!(stats.heart_rate, Tenths::ZERO);
         assert_eq!(stats.power, 27);
         assert_eq!(stats.energy, 2);
         assert_eq!(stats.minutes, 0);
         assert_eq!(stats.seconds, 0x33);
-        assert_eq!(stats.distance, 0.1);
+        assert_eq!(stats.distance, Tenths(1), "0.1 km");
         assert_eq!(stats.gear, 8);
     }
 
@@ -172,11 +172,11 @@ mod tests {
     fn given_real_live_capture_when_parsed_then_all_fields_are_decoded() {
         let stats = parse_keiser_data(&LIVE_CAPTURE).unwrap();
         assert!(!stats.is_paused);
-        assert_eq!(stats.cadence, 82.0);
+        assert_eq!(stats.cadence, Tenths(820), "82.0 rpm");
         assert_eq!(stats.power, 0x34);
         assert_eq!(stats.minutes, 1);
         assert_eq!(stats.seconds, 0);
-        assert_eq!(stats.distance, 0.2);
+        assert_eq!(stats.distance, Tenths(2), "0.2 km");
         assert_eq!(stats.gear, 8);
     }
 
@@ -242,7 +242,10 @@ mod tests {
     fn given_the_minimum_supported_firmware_when_parsed_then_the_packet_is_accepted() {
         let mut data = PAUSED_CAPTURE;
         data[1] = 0x21; // firmware 6.21 — the first build with a gear byte
-        assert_eq!(parse_keiser_data(&data).unwrap().version, "06.21");
+        assert_eq!(
+            parse_keiser_data(&data).unwrap().version.to_string(),
+            "06.21"
+        );
     }
 
     #[test]
@@ -258,7 +261,10 @@ mod tests {
         // reading. Keiser's own docs use it as their parse example.
         let mut data = PAUSED_CAPTURE;
         data[1] = 0x30;
-        assert_eq!(parse_keiser_data(&data).unwrap().version, "06.30");
+        assert_eq!(
+            parse_keiser_data(&data).unwrap().version.to_string(),
+            "06.30"
+        );
     }
 
     #[test]
@@ -305,7 +311,7 @@ mod tests {
         assert!(parse_keiser_data(&[]).is_none());
     }
 
-    fn filter_for(value: Option<&str>) -> Option<u8> {
+    fn filter_for(value: Option<&str>) -> Option<BikeId> {
         bike_id_filter(|key| {
             assert_eq!(key, "KEISER_BIKE_ID");
             value.map(str::to_string)
@@ -328,12 +334,12 @@ mod tests {
     fn given_a_bike_id_of_zero_when_the_filter_is_read_then_it_is_a_real_filter() {
         // The deployed bike reports ordinal id 0, so 0 must not collapse into
         // "unset" — otherwise the one id that matters cannot be selected.
-        assert_eq!(filter_for(Some("0")), Some(0));
+        assert_eq!(filter_for(Some("0")), Some(BikeId(0)));
     }
 
     #[test]
     fn given_a_valid_bike_id_when_the_filter_is_read_then_it_is_used() {
-        assert_eq!(filter_for(Some("200")), Some(200));
+        assert_eq!(filter_for(Some("200")), Some(BikeId(200)));
     }
 
     #[test]

@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::fmt;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,7 +17,7 @@ pub const STALE_AFTER: Duration = Duration::from_secs(20);
 /// have to rebuild per-bike state from the stream. A snapshot loses nothing,
 /// because each write is a complete picture of the fleet. Bikes are never
 /// removed; a bike that stops advertising simply goes stale.
-pub type Fleet = BTreeMap<u8, Reading>;
+pub type Fleet = BTreeMap<BikeId, Reading>;
 
 /// A new, empty fleet channel: nothing heard yet.
 pub fn fleet_channel() -> (watch::Sender<Arc<Fleet>>, watch::Receiver<Arc<Fleet>>) {
@@ -65,30 +67,90 @@ pub async fn next_snapshot(
     Some(current_snapshot(rx))
 }
 
-/// The bike id as it appears in names and topics: zero-padded to three
-/// digits, so `#7` and `#42` sort and align with `#200`.
-pub fn bike_id_label(bike_id: u8) -> String {
-    format!("{bike_id:03}")
+/// The ordinal id set on a bike's console, 0–200.
+///
+/// Displays zero-padded to three digits (`042`), which is how it appears in
+/// topics and names so `#7` and `#42` sort and align with `#200`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BikeId(pub u8);
+
+impl BikeId {
+    /// The display name of one bike, shared by the BLE advertisement and the
+    /// Home Assistant device so a rider sees the same name in Zwift and on
+    /// the dashboard.
+    pub fn display_name(self) -> String {
+        format!("Keiser M3i #{self}")
+    }
 }
 
-/// The display name of one bike, shared by the BLE advertisement and the Home
-/// Assistant device so a rider sees the same name in Zwift and on the
-/// dashboard.
-pub fn bike_display_name(bike_id: u8) -> String {
-    format!("Keiser M3i #{}", bike_id_label(bike_id))
+impl From<u8> for BikeId {
+    fn from(id: u8) -> Self {
+        BikeId(id)
+    }
+}
+
+impl fmt::Display for BikeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:03}", self.0)
+    }
+}
+
+/// A value the bike transmits as `value * 10` in a `u16`: cadence, heart rate
+/// and distance. Kept in that form so it prints exactly (`50.2`, never
+/// `50.20000076293945`) and arithmetic on the wire representation stays
+/// integral.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Tenths(pub u16);
+
+impl Tenths {
+    pub const ZERO: Tenths = Tenths(0);
+
+    pub fn as_f64(self) -> f64 {
+        f64::from(self.0) / 10.0
+    }
+
+    /// The whole part, truncated.
+    pub fn whole(self) -> u16 {
+        self.0 / 10
+    }
+
+    pub fn is_positive(self) -> bool {
+        self.0 > 0
+    }
+}
+
+impl fmt::Display for Tenths {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.0 / 10, self.0 % 10)
+    }
+}
+
+/// Firmware version as the two BCD-decoded bytes, displayed as `06.24`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Version {
+    pub major: u8,
+    pub minor: u8,
+}
+
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:02}.{:02}", self.major, self.minor)
+    }
 }
 
 /// One decoded advertisement: exactly what the bike broadcast.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct KeiserStats {
-    pub bike_id: u8,
-    pub version: String,
+    pub bike_id: BikeId,
+    pub version: Version,
     pub power: u16,
-    pub cadence: f32,
-    pub heart_rate: f32,
+    /// RPM.
+    pub cadence: Tenths,
+    /// BPM.
+    pub heart_rate: Tenths,
     pub is_paused: bool,
     /// Trip distance in km (only metric bikes are supported).
-    pub distance: f32,
+    pub distance: Tenths,
     /// Accumulated energy in KCal (only metric bikes are supported).
     pub energy: u16,
     pub minutes: u8,
@@ -99,6 +161,20 @@ pub struct KeiserStats {
 impl KeiserStats {
     pub fn elapsed_seconds(&self) -> u16 {
         self.minutes as u16 * 60 + self.seconds as u16
+    }
+}
+
+/// Stats that are safe to publish: obtained only through
+/// [`Reading::sanitized`], so anything that takes a `&Sanitized` cannot be
+/// handed a raw reading whose live metrics may be hours old.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sanitized(KeiserStats);
+
+impl Deref for Sanitized {
+    type Target = KeiserStats;
+
+    fn deref(&self) -> &KeiserStats {
+        &self.0
     }
 }
 
@@ -125,14 +201,14 @@ impl Reading {
     /// The data as it should be published: live metrics zeroed when the
     /// reading is stale or the bike is paused, so consumers never report an
     /// outdated reading as current.
-    pub fn sanitized(&self) -> KeiserStats {
+    pub fn sanitized(&self) -> Sanitized {
         let mut stats = self.stats.clone();
         if self.is_stale() || self.stats.is_paused {
             stats.power = 0;
-            stats.cadence = 0.0;
-            stats.heart_rate = 0.0;
+            stats.cadence = Tenths::ZERO;
+            stats.heart_rate = Tenths::ZERO;
         }
-        stats
+        Sanitized(stats)
     }
 }
 
@@ -143,8 +219,8 @@ mod tests {
     fn live_stats() -> KeiserStats {
         KeiserStats {
             power: 150,
-            cadence: 85.0,
-            heart_rate: 120.0,
+            cadence: Tenths(850),
+            heart_rate: Tenths(1200),
             ..Default::default()
         }
     }
@@ -164,16 +240,16 @@ mod tests {
     fn given_recent_data_when_sanitized_then_metrics_are_kept() {
         let stats = live_reading().sanitized();
         assert_eq!(stats.power, 150);
-        assert_eq!(stats.cadence, 85.0);
-        assert_eq!(stats.heart_rate, 120.0);
+        assert_eq!(stats.cadence, Tenths(850));
+        assert_eq!(stats.heart_rate, Tenths(1200));
     }
 
     #[test]
     fn given_a_stale_reading_when_sanitized_then_metrics_are_zeroed() {
         let stats = stale_reading().sanitized();
         assert_eq!(stats.power, 0);
-        assert_eq!(stats.cadence, 0.0);
-        assert_eq!(stats.heart_rate, 0.0);
+        assert_eq!(stats.cadence, Tenths::ZERO);
+        assert_eq!(stats.heart_rate, Tenths::ZERO);
     }
 
     #[test]
@@ -182,8 +258,8 @@ mod tests {
         reading.stats.is_paused = true;
         let stats = reading.sanitized();
         assert_eq!(stats.power, 0);
-        assert_eq!(stats.cadence, 0.0);
-        assert_eq!(stats.heart_rate, 0.0);
+        assert_eq!(stats.cadence, Tenths::ZERO);
+        assert_eq!(stats.heart_rate, Tenths::ZERO);
     }
 
     #[test]
@@ -191,11 +267,11 @@ mod tests {
         // Staleness zeroes the live metrics; it does not forget which bike or
         // how far it went.
         let mut reading = stale_reading();
-        reading.stats.bike_id = 42;
-        reading.stats.distance = 4.5;
+        reading.stats.bike_id = BikeId(42);
+        reading.stats.distance = Tenths(45);
         let stats = reading.sanitized();
-        assert_eq!(stats.bike_id, 42);
-        assert_eq!(stats.distance, 4.5);
+        assert_eq!(stats.bike_id, BikeId(42));
+        assert_eq!(stats.distance, Tenths(45));
     }
 
     #[test]
@@ -204,9 +280,9 @@ mod tests {
         // bike 2's packet would have replaced bike 1's before a consumer woke.
         let (tx, rx) = fleet_channel();
         let mut bike_1 = live_stats();
-        bike_1.bike_id = 1;
+        bike_1.bike_id = BikeId(1);
         let mut bike_2 = live_stats();
-        bike_2.bike_id = 2;
+        bike_2.bike_id = BikeId(2);
         bike_2.power = 200;
 
         record_reading(&tx, Reading::now(bike_1));
@@ -214,15 +290,15 @@ mod tests {
 
         let fleet = rx.borrow();
         assert_eq!(fleet.len(), 2);
-        assert_eq!(fleet[&1].stats.power, 150);
-        assert_eq!(fleet[&2].stats.power, 200);
+        assert_eq!(fleet[&BikeId(1)].stats.power, 150);
+        assert_eq!(fleet[&BikeId(2)].stats.power, 200);
     }
 
     #[test]
     fn given_a_bike_heard_again_when_recorded_then_its_reading_is_replaced() {
         let (tx, rx) = fleet_channel();
         let mut first = live_stats();
-        first.bike_id = 7;
+        first.bike_id = BikeId(7);
         let mut second = first.clone();
         second.power = 160;
 
@@ -230,7 +306,7 @@ mod tests {
         record_reading(&tx, Reading::now(second));
 
         assert_eq!(rx.borrow().len(), 1);
-        assert_eq!(rx.borrow()[&7].stats.power, 160);
+        assert_eq!(rx.borrow()[&BikeId(7)].stats.power, 160);
     }
 
     #[test]
@@ -239,35 +315,58 @@ mod tests {
         // the map change under it.
         let (tx, mut rx) = fleet_channel();
         let mut bike = live_stats();
-        bike.bike_id = 1;
+        bike.bike_id = BikeId(1);
         record_reading(&tx, Reading::now(bike.clone()));
         let held = current_snapshot(&mut rx);
 
         bike.power = 999;
         record_reading(&tx, Reading::now(bike));
 
-        assert_eq!(held[&1].stats.power, 150);
-        assert_eq!(rx.borrow()[&1].stats.power, 999);
+        assert_eq!(held[&BikeId(1)].stats.power, 150);
+        assert_eq!(rx.borrow()[&BikeId(1)].stats.power, 999);
     }
 
     #[test]
-    fn given_a_bike_id_when_labelled_then_it_is_zero_padded_to_three_digits() {
-        assert_eq!(bike_id_label(0), "000");
-        assert_eq!(bike_id_label(7), "007");
-        assert_eq!(bike_id_label(42), "042");
-        assert_eq!(bike_id_label(200), "200");
+    fn given_a_bike_id_when_displayed_then_it_is_zero_padded_to_three_digits() {
+        assert_eq!(BikeId(0).to_string(), "000");
+        assert_eq!(BikeId(7).to_string(), "007");
+        assert_eq!(BikeId(42).to_string(), "042");
+        assert_eq!(BikeId(200).to_string(), "200");
     }
 
     #[test]
     fn given_a_bike_id_when_named_then_the_name_carries_the_padded_id() {
-        assert_eq!(bike_display_name(42), "Keiser M3i #042");
+        assert_eq!(BikeId(42).display_name(), "Keiser M3i #042");
+    }
+
+    #[test]
+    fn given_tenths_when_converted_then_they_print_and_divide_exactly() {
+        // The real capture's 50.2 rpm: as an f32 widened to f64 this printed
+        // as 50.20000076293945 and reached the Home Assistant dashboard.
+        assert_eq!(Tenths(502).to_string(), "50.2");
+        assert_eq!(Tenths(502).as_f64().to_string(), "50.2");
+        assert_eq!(Tenths(1).as_f64().to_string(), "0.1");
+        assert_eq!(Tenths(1205).whole(), 120);
+        assert!(!Tenths::ZERO.is_positive());
+    }
+
+    #[test]
+    fn given_a_version_when_displayed_then_both_parts_are_two_digits() {
+        assert_eq!(
+            Version {
+                major: 6,
+                minor: 24
+            }
+            .to_string(),
+            "06.24"
+        );
     }
 
     const POLL: Duration = Duration::from_secs(1);
 
     fn fleet_with(power: u16) -> Arc<Fleet> {
         Arc::new(Fleet::from([(
-            0,
+            BikeId(0),
             Reading::now(KeiserStats {
                 power,
                 ..live_stats()
@@ -276,7 +375,7 @@ mod tests {
     }
 
     fn power_of(fleet: &Fleet) -> u16 {
-        fleet[&0].stats.power
+        fleet[&BikeId(0)].stats.power
     }
 
     #[tokio::test(start_paused = true)]
