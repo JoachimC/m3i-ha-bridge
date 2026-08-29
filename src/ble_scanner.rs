@@ -57,7 +57,8 @@ pub trait BleScanner {
 /// discovery filter should make this unnecessary, but that has not been
 /// confirmed on the hardware, and retiring it is a separate change with its
 /// own measurement (see `doc/bluetooth-protocol.md`).
-pub const SCAN_RESTART_INTERVAL: Duration = Duration::from_secs(60);
+// MEASUREMENT BUILD for issue #2: restart effectively disabled.
+pub const SCAN_RESTART_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Pause between stopping a scan and starting the next, so the stack has
 /// processed the stop before it is asked to start again.
