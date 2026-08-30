@@ -1,8 +1,8 @@
 //! BLE scanning on Linux, via bluer.
 //!
-//! Shares its `Session` with the GATT server, so the whole process holds one
-//! D-Bus connection and one set of match rules instead of two BlueZ client
-//! stacks contending for the same controller.
+//! The scanner shares its `Session` with the GATT server, so the whole
+//! process holds one D-Bus connection and one set of match rules. Two
+//! separate BlueZ client stacks would contend for the same controller.
 
 use std::collections::HashSet;
 use std::pin::Pin;
@@ -47,25 +47,25 @@ impl BleScanner for BluerScanner {
     }
 }
 
-/// The reason for the port, and the one function that would silence the bridge
-/// entirely if it were wrong.
+/// This function is the reason for the port to bluer, and a wrong value here
+/// silences the bridge entirely.
 ///
 /// **Never** write `..Default::default()` over these two fields. bluer's
 /// `DiscoveryFilter::default()` is `transport: Auto` with
-/// `duplicate_data: false` — both bugs at once, and both silent:
+/// `duplicate_data: false`. Both values are bugs, and both are silent:
 ///
 /// - `Auto` on a dual-mode controller makes BlueZ interleave LE scanning with
-///   classic-Bluetooth inquiry, so the radio is deaf to the bike for seconds at
-///   a time. This filter is the only LE-only control: the Pi's
+///   classic-Bluetooth inquiry. The radio then does not receive the bike for
+///   seconds at a time. This filter is the only LE-only control: the Pi's
 ///   `/etc/bluetooth/main.conf` sets no `ControllerMode`, and a measured ride
-///   confirms that the filter alone keeps the update rate healthy (issue #3).
+///   confirms that the filter alone keeps the update rate normal (issue #3).
 /// - `duplicate_data: false` lets bluetoothd suppress a `ManufacturerData`
-///   signal whose payload is unchanged — which is precisely the paused-bike
-///   case. It is also load-bearing a layer down: a filter with no other
-///   criteria and `duplicate_data: false` is treated by BlueZ as an *empty*
-///   filter and downgraded to regular discovery, which on controllers carrying
-///   `HCI_QUIRK_STRICT_DUPLICATE_FILTER` (Broadcom, i.e. the Pi Zero W) leaves
-///   the controller's own duplicate filter enabled.
+///   signal whose payload did not change. That is exactly the paused-bike
+///   case. The value also matters one layer down: BlueZ treats a filter with
+///   no other criteria and `duplicate_data: false` as an *empty* filter and
+///   downgrades it to regular discovery. On controllers with
+///   `HCI_QUIRK_STRICT_DUPLICATE_FILTER` (Broadcom, so the Pi Zero W),
+///   regular discovery leaves the controller's own duplicate filter enabled.
 fn discovery_filter() -> DiscoveryFilter {
     DiscoveryFilter {
         transport: DiscoveryTransport::Le,
@@ -95,8 +95,8 @@ fn scan_stream(
 
         loop {
             tokio::select! {
-                // Ending the stream is how cancellation is reported; run_bridge
-                // reads it together with the token.
+                // The stream ends to report cancellation; run_bridge reads
+                // the end together with the token.
                 _ = cancel_token.cancelled() => break,
 
                 adapter_event = discovery.next() => {
@@ -107,10 +107,11 @@ fn scan_stream(
                         Some(AdapterEvent::DeviceRemoved(address)) => subscriptions.forget(address),
                         Some(AdapterEvent::PropertyChanged(_)) => {}
                         None => {
-                            // bluer ends this stream on Discovering=false, which
-                            // BlueZ emits only on an explicit stop or an adapter
-                            // power-down — never during the kernel's own ~10 s
-                            // scan recycling. So this really is an error.
+                            // bluer ends this stream on Discovering=false.
+                            // BlueZ emits that only on an explicit stop or an
+                            // adapter power-down, never during the kernel's
+                            // own ~10 s scan recycling. So this really is an
+                            // error.
                             yield ScanEvent::Error("BlueZ discovery ended unexpectedly".into());
                             break;
                         }
@@ -130,17 +131,17 @@ fn scan_stream(
 /// Upper bound on live per-device subscriptions.
 ///
 /// The set grows with every distinct BLE device that the radio hears, and
-/// the scan runs for the life of the process, so this cap bounds the set.
+/// the scan runs for the life of the process. This cap bounds the set.
 /// `DeviceRemoved` events free slots when BlueZ purges a device. The cap is
-/// generous for a home: hitting it means an abnormal radio environment, and
-/// the warning in `try_subscribe` makes that visible in the journal.
+/// large for a home: a full set means an abnormal radio environment, and the
+/// warning in `try_subscribe` shows that in the journal.
 const MAX_SUBSCRIPTIONS: usize = 128;
 
-/// Per-device subscriptions, fanned out in-process from the session's single
-/// PropertiesChanged match rule: no D-Bus round trip per device, and none per
-/// advertisement.
+/// Per-device subscriptions, distributed in-process from the session's
+/// single PropertiesChanged match rule. This costs no D-Bus round trip per
+/// device, and none per advertisement.
 ///
-/// Bounded by [`MAX_SUBSCRIPTIONS`].
+/// [`MAX_SUBSCRIPTIONS`] bounds the set.
 #[derive(Default)]
 struct DeviceSubscriptions {
     events: SelectAll<BoxStream<'static, AddressedDeviceEvent>>,
@@ -148,13 +149,13 @@ struct DeviceSubscriptions {
 }
 
 impl DeviceSubscriptions {
-    /// Subscribes to one device's property changes, once. A failed
-    /// subscription is forgotten so a later DeviceAdded can retry.
+    /// Subscribes to one device's property changes, once. The method forgets
+    /// a failed subscription so a later DeviceAdded can retry.
     ///
-    /// Deliberately does *not* read `device.manufacturer_data()`. That returns
-    /// BlueZ's cached payload, which would then be stamped as freshly
-    /// received. The cost of not doing it is one missed advertisement (~2 s)
-    /// per device appearance, well inside the 20 s staleness window.
+    /// Deliberately does *not* read `device.manufacturer_data()`. That call
+    /// returns BlueZ's cached payload, and the parser would then mark old
+    /// data as fresh. The cost is one missed advertisement (~2 s) each time a
+    /// device appears, well inside the 20 s staleness window.
     async fn try_subscribe(&mut self, adapter: &Adapter, address: Address) {
         if self.subscribed.contains(&address) {
             return;
@@ -205,7 +206,7 @@ impl DeviceSubscriptions {
 
 /// Maps one device event to an advertisement, if it carries one.
 ///
-/// Pure, so the mapping is unit-tested without a D-Bus connection.
+/// Pure, so unit tests cover the mapping without a D-Bus connection.
 fn to_advertisement((address, event): AddressedDeviceEvent) -> Option<ReceivedAdvertisement> {
     match event {
         DeviceEvent::PropertyChanged(DeviceProperty::ManufacturerData(manufacturer_data)) => {
@@ -227,10 +228,10 @@ mod tests {
 
     #[test]
     fn given_the_discovery_filter_when_built_then_le_transport_and_duplicates_are_requested() {
-        // Worth more than the rest of this file's tests combined: it is a
-        // compile-and-run assertion on the single line whose two silent default
-        // values would leave the bridge deaf half the time and blind to a
-        // paused bike.
+        // The most important test in this file: it asserts, at run time, the
+        // single line whose two silent default values break the bridge. A
+        // wrong transport loses half of the packets; a wrong duplicate_data
+        // hides a paused bike.
         let filter = discovery_filter();
         assert_eq!(
             filter.transport,
@@ -245,10 +246,10 @@ mod tests {
 
     #[test]
     fn given_bluers_defaults_when_compared_then_neither_is_what_this_bridge_needs() {
-        // Pins *why* the two fields above are written out explicitly, so nobody
-        // simplifies discovery_filter() to `Default::default()` and reintroduces
-        // both bugs. bluer's own doc comment claims the default provides
-        // duplicate data; it has not since 0.17.
+        // Records why the code writes the two fields explicitly, so nobody
+        // simplifies discovery_filter() to `Default::default()` and
+        // reintroduces both bugs. bluer's own doc comment claims that the
+        // default provides duplicate data; versions since 0.17 do not.
         let defaults = DiscoveryFilter::default();
         assert_eq!(defaults.transport, DiscoveryTransport::Auto);
         assert!(!defaults.duplicate_data);
@@ -271,7 +272,7 @@ mod tests {
 
     #[test]
     fn given_a_full_set_when_a_device_is_forgotten_then_a_slot_frees() {
-        // A permanent lockout at the cap would silence a bike that BlueZ
+        // A full set that never frees slots would block a bike that BlueZ
         // removes and later re-announces; forget() must free its slot.
         let mut subscriptions = DeviceSubscriptions::default();
         for i in 0..MAX_SUBSCRIPTIONS {
@@ -294,8 +295,8 @@ mod tests {
 
     #[test]
     fn given_an_unrelated_property_change_when_mapped_then_nothing_is_produced() {
-        // Devices emit RSSI and name changes constantly; only manufacturer data
-        // is an advertisement as far as this bridge is concerned.
+        // Devices emit RSSI and name changes constantly; only manufacturer
+        // data counts as an advertisement for this bridge.
         let event = DeviceEvent::PropertyChanged(DeviceProperty::Rssi(-60));
         assert!(to_advertisement((ADDRESS, event)).is_none());
     }

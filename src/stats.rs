@@ -6,17 +6,18 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
-/// How long after the last received advertisement a reading is considered stale.
+/// How long after the last received advertisement a reading counts as stale.
 pub const STALE_AFTER: Duration = Duration::from_secs(20);
 
-/// The latest reading from every bike heard so far, keyed by bike id.
+/// The latest reading from every bike that the bridge heard so far, keyed
+/// by bike id.
 ///
 /// This is what the watch channel carries. A single reading would be
 /// last-writer-wins: with two bikes in range, packets from one would
-/// overwrite the other's before a consumer woke, and every consumer would
-/// have to rebuild per-bike state from the stream. A snapshot loses nothing,
-/// because each write is a complete picture of the fleet. Bikes are never
-/// removed; a bike that stops advertising simply goes stale.
+/// overwrite the other's before a consumer woke. Every consumer would then
+/// rebuild per-bike state from the stream. A snapshot loses nothing,
+/// because each write is a complete picture of the fleet. The map never
+/// removes a bike; a bike that stops advertising becomes stale.
 pub type Fleet = BTreeMap<BikeId, Reading>;
 
 /// A new, empty fleet channel: nothing heard yet.
@@ -34,27 +35,28 @@ pub fn record_reading(fleet_tx: &watch::Sender<Arc<Fleet>>, reading: Reading) {
     });
 }
 
-/// The snapshot a consumer starts from, marked as seen.
+/// The snapshot a consumer starts from; the call marks it as seen.
 ///
-/// The marking is the point. `Receiver::clone` copies the *cloned receiver's*
-/// version rather than the channel's current one, so a per-subscriber clone
-/// can start arbitrarily far behind. Reading it with a plain `borrow` would
-/// leave that backlog unseen, and the loop's first [`next_snapshot`] would
-/// return the same value again immediately, notifying a new subscriber twice
-/// with identical data.
+/// The marking is the point. `Receiver::clone` copies the *cloned
+/// receiver's* version rather than the channel's current one, so a
+/// per-subscriber clone can start arbitrarily far behind. A plain `borrow`
+/// would leave that backlog unseen. The loop's first [`next_snapshot`]
+/// would then return the same value again immediately and notify a new
+/// subscriber twice with identical data.
 pub fn current_snapshot(rx: &mut watch::Receiver<Arc<Fleet>>) -> Arc<Fleet> {
     rx.borrow_and_update().clone()
 }
 
 /// Waits for the next reason to publish: either new data arrived, or
-/// `poll_interval` elapsed, so consumers still see values decay once a reading
-/// goes stale. Returns `None` once the producer is gone.
+/// `poll_interval` elapsed, so consumers still see values decay once a
+/// reading becomes stale. Returns `None` once the producer is gone.
 ///
-/// `borrow_and_update` rather than `borrow` again, for a narrower reason here:
-/// `timeout` drops the pending `changed()` future when it fires, so a value
-/// landing in that same instant is never marked seen. A plain `borrow` would
-/// return it and leave the version outstanding, so the next call would return
-/// the identical snapshot without waiting.
+/// The function uses `borrow_and_update` rather than `borrow`, for a
+/// narrower reason here: `timeout` drops the pending `changed()` future
+/// when it fires, so `changed()` never marks a value that lands in that
+/// same instant as seen. A plain `borrow` would return it and leave the
+/// version outstanding, so the next call would return the identical
+/// snapshot without waiting.
 pub async fn next_snapshot(
     rx: &mut watch::Receiver<Arc<Fleet>>,
     poll_interval: Duration,
@@ -67,10 +69,11 @@ pub async fn next_snapshot(
     Some(current_snapshot(rx))
 }
 
-/// The ordinal id set on a bike's console, 0–200.
+/// The ordinal id from the bike's console, 0–200.
 ///
-/// Displays zero-padded to three digits (`042`), which is how it appears in
-/// topics and names so `#7` and `#42` sort and align with `#200`.
+/// The id displays zero-padded to three digits (`042`), which is how it
+/// appears in topics and names so `#7` and `#42` sort and align with
+/// `#200`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BikeId(pub u8);
 
@@ -95,10 +98,10 @@ impl fmt::Display for BikeId {
     }
 }
 
-/// A value the bike transmits as `value * 10` in a `u16`: cadence, heart rate
-/// and distance. Kept in that form so it prints exactly (`50.2`, never
-/// `50.20000076293945`) and arithmetic on the wire representation stays
-/// integral.
+/// A value the bike transmits as `value * 10` in a `u16`: cadence, heart
+/// rate and distance. The type keeps that form so the value prints exactly
+/// (`50.2`, never `50.20000076293945`) and arithmetic on the wire
+/// representation stays integral.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Tenths(pub u16);
 
@@ -164,9 +167,9 @@ impl KeiserStats {
     }
 }
 
-/// Stats that are safe to publish: obtained only through
-/// [`Reading::sanitized`], so anything that takes a `&Sanitized` cannot be
-/// handed a raw reading whose live metrics may be hours old.
+/// Stats that are safe to publish. Only [`Reading::sanitized`] creates this
+/// type, so a function that takes a `&Sanitized` cannot receive a raw
+/// reading whose live metrics can be hours old.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sanitized(KeiserStats);
 
@@ -178,8 +181,8 @@ impl Deref for Sanitized {
     }
 }
 
-/// A reading as received: the bike's data plus when it arrived, which is what
-/// staleness is judged against.
+/// A reading as received: the bike's data plus the arrival time; the
+/// staleness check starts from that time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reading {
     pub stats: KeiserStats,
@@ -198,9 +201,9 @@ impl Reading {
         self.received_at.elapsed() > STALE_AFTER
     }
 
-    /// The data as it should be published: live metrics zeroed when the
-    /// reading is stale or the bike is paused, so consumers never report an
-    /// outdated reading as current.
+    /// The data in publishable form: the function zeroes the live metrics
+    /// when the reading is stale or the bike is paused, so consumers never
+    /// report an outdated reading as current.
     pub fn sanitized(&self) -> Sanitized {
         let mut stats = self.stats.clone();
         if self.is_stale() || self.stats.is_paused {
@@ -264,8 +267,8 @@ mod tests {
 
     #[test]
     fn given_a_stale_reading_when_sanitized_then_identity_and_totals_survive() {
-        // Staleness zeroes the live metrics; it does not forget which bike or
-        // how far it went.
+        // Staleness zeroes the live metrics; it keeps the bike identity and
+        // the totals.
         let mut reading = stale_reading();
         reading.stats.bike_id = BikeId(42);
         reading.stats.distance = Tenths(45);
@@ -312,7 +315,7 @@ mod tests {
     #[test]
     fn given_a_consumer_holding_a_snapshot_when_a_reading_is_recorded_then_its_copy_is_unchanged() {
         // `Arc::make_mut` copies on write, so a consumer mid-tick never sees
-        // the map change under it.
+        // the map change.
         let (tx, mut rx) = fleet_channel();
         let mut bike = live_stats();
         bike.bike_id = BikeId(1);
@@ -341,8 +344,8 @@ mod tests {
 
     #[test]
     fn given_tenths_when_converted_then_they_print_and_divide_exactly() {
-        // The real capture's 50.2 rpm: as an f32 widened to f64 this printed
-        // as 50.20000076293945 and reached the Home Assistant dashboard.
+        // Without Tenths, an f32 of 50.2 rpm widens to an f64 that prints
+        // as 50.20000076293945 on the Home Assistant dashboard.
         assert_eq!(Tenths(502).to_string(), "50.2");
         assert_eq!(Tenths(502).as_f64().to_string(), "50.2");
         assert_eq!(Tenths(1).as_f64().to_string(), "0.1");
@@ -381,10 +384,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn given_a_new_subscriber_when_it_reads_then_waits_then_the_snapshot_is_not_repeated() {
         // `Receiver::clone` copies the cloned receiver's version, and the
-        // receiver the GATT application is built from never observes
-        // anything, so every subscriber's clone starts behind. With a plain
-        // `borrow` the first `next_snapshot` returns the same value instantly
-        // and the client is notified twice on subscribe.
+        // receiver that the GATT application holds never observes anything,
+        // so every subscriber's clone starts behind. With a plain `borrow`
+        // the first `next_snapshot` returns the same value instantly and
+        // notifies the client twice on subscribe.
         let (fleet_tx, build_time_rx) = fleet_channel();
         fleet_tx.send(fleet_with(150)).unwrap();
         let mut rx = build_time_rx.clone();
@@ -416,8 +419,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_no_new_data_when_waiting_for_the_next_snapshot_then_the_poll_interval_elapses() {
-        // The re-publish that lets consumers watch a reading decay to zero once
-        // it goes stale, rather than sitting on the last live value forever.
+        // The re-publish lets consumers watch a reading decay to zero once
+        // it becomes stale; without it, the last live value would stay
+        // forever.
         let (_fleet_tx, mut rx) = watch::channel(fleet_with(150));
         let _seen = current_snapshot(&mut rx);
 
@@ -440,10 +444,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_a_snapshot_that_arrived_unobserved_when_it_is_read_then_it_is_not_redelivered() {
-        // The state left behind when `timeout` wins the race and drops the
+        // The state that remains when `timeout` wins the race and drops the
         // pending `changed()`: a value is outstanding, and the loop reads it
-        // without `changed()` ever having marked it seen. `mark_changed`
-        // reproduces that without having to lose the race on purpose.
+        // while `changed()` never marked it seen. `mark_changed` reproduces
+        // that state directly.
         let (_fleet_tx, mut rx) = watch::channel(fleet_with(150));
         rx.mark_changed();
 

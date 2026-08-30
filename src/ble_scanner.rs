@@ -1,5 +1,5 @@
-//! The scanner abstraction: what a platform's BLE stack has to yield for the
-//! bridge to work — bluer on Linux, btleplug elsewhere.
+//! The scanner abstraction: what a platform's BLE stack must yield for the
+//! bridge to work. Linux uses bluer; other platforms use btleplug.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -10,9 +10,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::BoxError;
 
-/// One received advertisement, reduced to the only part this bridge reads.
-/// Not to be confused with `bluer::adv::Advertisement`, which is what the
-/// bridge *broadcasts*.
+/// One received advertisement, reduced to the only part that this bridge
+/// reads. This is not `bluer::adv::Advertisement`, which the bridge
+/// *broadcasts*.
 #[derive(Debug, Clone)]
 pub struct ReceivedAdvertisement {
     /// Address or id of the sender. For logging only — nothing branches on it.
@@ -23,8 +23,8 @@ pub struct ReceivedAdvertisement {
 #[derive(Debug)]
 pub enum ScanEvent {
     Advertisement(ReceivedAdvertisement),
-    /// The scan cannot continue. The caller tears down and `bridge_loop`
-    /// decides whether to retry.
+    /// The scan cannot continue. The caller releases its resources, and
+    /// `bridge_loop` decides whether to retry.
     Error(BoxError),
 }
 
@@ -32,24 +32,23 @@ pub type ScanStream = Pin<Box<dyn Stream<Item = ScanEvent> + Send>>;
 
 /// Something that yields BLE advertisements.
 ///
-/// The boundary is deliberately *raw manufacturer data* rather than parsed
-/// `KeiserStats`. Pushing the Keiser id match, the parse, the bike-id filter
-/// and the logging down into the platform implementations would duplicate the
-/// only interesting logic in the crate across a `cfg` split that CI can compile
-/// just one half of. Kept above this trait, all of it is covered by tests that
-/// run everywhere.
+/// The boundary is deliberately *raw manufacturer data*, not parsed
+/// `KeiserStats`. The Keiser id match, the parse, the bike-id filter, and the
+/// logging stay above this trait. If each platform implementation held that
+/// logic, CI could compile only one half of the duplicate. Above the trait,
+/// tests that run on every platform cover all of it.
 pub trait BleScanner {
-    /// Written as a desugared RPITIT rather than `async fn` so the `Send` bound
-    /// on the returned future is explicit. Cancellation is signalled by ending
-    /// the stream; there is no dedicated event.
+    /// A desugared RPITIT instead of `async fn` makes the `Send` bound on the
+    /// returned future explicit. The stream ends to signal cancellation; no
+    /// dedicated event exists.
     fn scan(
         &self,
         cancel_token: CancellationToken,
     ) -> impl Future<Output = Result<ScanStream, BoxError>> + Send;
 }
 
-/// Which advertisements are worth a trace line: the first few, so a scan that
-/// starts can be seen to, then one in every hundred. This is the 2 Hz hot
+/// Selects the advertisements that get a trace line: the first few, which
+/// show that a scan starts, then one in every hundred. This is the 2 Hz hot
 /// path, and every bike in range contributes.
 pub fn is_sampled_for_trace(count: u64) -> bool {
     const TRACE_FIRST: u64 = 10;

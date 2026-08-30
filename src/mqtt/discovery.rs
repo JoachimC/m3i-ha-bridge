@@ -1,5 +1,5 @@
-//! What Home Assistant is told about a bike: the device-discovery config and
-//! the state payload its templates read.
+//! What the bridge tells Home Assistant about a bike: the device-discovery
+//! config and the state payload its templates read.
 
 use serde_json::json;
 
@@ -37,11 +37,11 @@ pub(super) struct SensorSpec {
     value_template: &'static str,
     unit: Option<&'static str>,
     device_class: Option<&'static str>,
-    /// Drives Home Assistant's long-term statistics. Without it a sensor is
-    /// recorded in history but never aggregated.
+    /// Drives Home Assistant's long-term statistics. Without it, Home
+    /// Assistant records a sensor in history but never aggregates it.
     state_class: Option<&'static str>,
-    /// Display only — the state itself is already rounded to the bike's
-    /// resolution when the payload is built.
+    /// Display only — the payload builder already rounds the state to the
+    /// bike's resolution.
     precision: Option<u8>,
     icon: Option<&'static str>,
     /// `diagnostic` moves an entity out of the device's main sensor list into
@@ -82,16 +82,16 @@ impl SensorSpec {
 
 /// Home Assistant metadata for each published sensor.
 ///
-/// The device-class choices are constrained, not free: `power` accepts only
+/// Home Assistant constrains the device-class choices: `power` accepts only
 /// `measurement`, and `energy` only `total`/`total_increasing`. Where Home
-/// Assistant allows a choice it is semantic — `total_increasing` for distance
-/// and energy, which accumulate through a ride and reset to zero on the next
-/// one (exactly the case that state class exists for), and `measurement` for
-/// elapsed time, where the useful statistic is the live value rather than a
-/// lifetime sum of seconds.
+/// Assistant allows a choice, the choice is semantic. Distance and energy
+/// use `total_increasing`: they accumulate through a ride and reset to zero
+/// on the next one, which is exactly the case that state class exists for.
+/// Elapsed time uses `measurement`: the useful statistic is the live value,
+/// not a lifetime sum of seconds.
 ///
-/// Heart rate and cadence have no device class in Home Assistant; `bpm` and
-/// `rpm` are accepted as free-form units.
+/// Heart rate and cadence have no device class in Home Assistant; it
+/// accepts `bpm` and `rpm` as free-form units.
 pub(super) const SENSORS: &[SensorSpec] = &[
     SensorSpec {
         object_id: "power",
@@ -155,11 +155,11 @@ pub(super) const SENSORS: &[SensorSpec] = &[
         name: "Energy",
         value_template: "{{ value_json.energy }}",
         unit: Some("kcal"),
-        // Home Assistant's energy device class has accepted cal/kcal/Mcal/Gcal
-        // since 2024.10, which is what makes this valid. On an older Home
-        // Assistant the entity would be rejected outright — drop the device
-        // class if you need to support one; the unit and state class alone
-        // still give long-term statistics.
+        // Home Assistant 2024.10 and later accepts cal/kcal/Mcal/Gcal for
+        // the energy device class, which makes this valid. An older Home
+        // Assistant rejects the entity outright. To support one, remove the
+        // device class; the unit and state class alone still give long-term
+        // statistics.
         device_class: Some("energy"),
         state_class: Some("total_increasing"),
         precision: Some(0),
@@ -178,8 +178,8 @@ pub(super) const SENSORS: &[SensorSpec] = &[
         entity_category: None,
     },
     // Identity rather than a measurement: no unit, no state class (there is
-    // nothing to aggregate), and filed under Diagnostic so it does not sit
-    // between Power and Cadence on the dashboard.
+    // nothing to aggregate), and in the Diagnostic category so it does not
+    // sit between Power and Cadence on the dashboard.
     SensorSpec {
         object_id: "bike_id",
         name: "Bike ID",
@@ -194,30 +194,31 @@ pub(super) const SENSORS: &[SensorSpec] = &[
 ];
 
 /// Home Assistant device-based MQTT discovery: one retained config per bike
-/// carrying every entity, so sensors appear automatically without any YAML on
-/// the HA side.
+/// carries every entity, so sensors appear automatically without any YAML
+/// on the HA side.
 ///
-/// Device discovery (`<prefix>/device/<node_id>/config` with a `components`
-/// map; Home Assistant 2024.11+) rather than one retained topic per entity.
+/// The bridge uses device discovery (`<prefix>/device/<node_id>/config`
+/// with a `components` map; Home Assistant 2024.11+) rather than one
+/// retained topic per entity.
 ///
-/// `state_topic`, `availability` and `availability_mode` are shared at the
-/// root and inherited by every component; `expire_after` is a per-entity
-/// option and so is repeated in each. `device` and `origin` are mandatory
-/// here, not merely recommended.
+/// The root holds `state_topic`, `availability` and `availability_mode`,
+/// and every component inherits them. `expire_after` is a per-entity
+/// option, so each component repeats it. `device` and `origin` are
+/// mandatory here, not merely recommended.
 ///
 /// # Entity naming
 ///
 /// Each component announces a short `name` ("Power") plus the shared `device`
 /// block, and Home Assistant composes the two: friendly name "Keiser M3i #042
-/// Power", entity id `sensor.keiser_m3i_042_power`. There is no bare
-/// `sensor.power` to collide with anything else on the instance, and two bikes
+/// Power", entity id `sensor.keiser_m3i_042_power`. No bare `sensor.power`
+/// exists to collide with anything else on the instance, and two bikes
 /// never collide with each other.
 ///
 /// Do **not** add `"has_entity_name": true` to these payloads. It is not an
-/// MQTT discovery option — the MQTT integration sets `_attr_has_entity_name`
-/// unconditionally on every entity (since Home Assistant 2023.8), and the
-/// discovery schema uses `extra=vol.REMOVE_EXTRA`, so the key is silently
-/// discarded. Adding it would look like it did something while changing
+/// MQTT discovery option: the MQTT integration (Home Assistant 2023.8 and
+/// later) sets `_attr_has_entity_name` unconditionally on every entity, and
+/// the discovery schema uses `extra=vol.REMOVE_EXTRA`, so it discards the
+/// key silently. The key would read as configuration while it changes
 /// nothing.
 pub(super) fn discovery_message(topics: &Topics, bike_id: BikeId) -> (String, serde_json::Value) {
     let node_id = topics.node_id(bike_id);
@@ -228,8 +229,9 @@ pub(super) fn discovery_message(topics: &Topics, bike_id: BikeId) -> (String, se
         "model": "M3i",
     });
     // Both must say online: the bridge's topic carries the last will, so a
-    // crash takes every bike down; the bike's own topic goes offline when its
-    // readings go stale, so a bike that is switched off greys out on its own.
+    // crash sets every bike offline; the bike's own topic goes offline when
+    // its readings go stale, so a powered-off bike shows unavailable on its
+    // own.
     let availability = json!([
         { "topic": topics.bridge_availability() },
         { "topic": topics.bike_availability(bike_id) },
@@ -320,9 +322,9 @@ mod tests {
     #[test]
     fn given_the_real_capture_when_the_state_payload_is_serialized_then_it_carries_no_float_noise()
     {
-        // End to end from the bytes doc/sample-data.md actually captured,
-        // because the state is a string Home Assistant renders verbatim:
-        // cadence 502 -> 50.2 rpm and distance 1 -> 0.1 km would otherwise
+        // End to end from the bytes that doc/sample-data.md captured,
+        // because the state is a string Home Assistant renders verbatim.
+        // Cadence 502 -> 50.2 rpm and distance 1 -> 0.1 km would otherwise
         // serialize as 50.20000076293945 and 0.10000000149011612.
         let mut stats = crate::keiser::parse(&hex!("0624ff00f60100001b0002000033018008"))
             .expect("the captured packet should parse");
@@ -375,8 +377,8 @@ mod tests {
     #[test]
     fn given_the_discovery_message_when_built_then_the_shared_options_are_at_the_root_only() {
         // Device discovery inherits state_topic and availability from the
-        // root; repeating them per component would be redundant and, for
-        // device/origin, is not permitted at all.
+        // root. To repeat them per component would be redundant, and the
+        // schema forbids device and origin there.
         let (_, payload) = device_discovery();
         for (object_id, component) in payload["components"].as_object().unwrap() {
             for shared in [
@@ -516,11 +518,11 @@ mod tests {
 
     #[test]
     fn given_a_device_class_when_announced_then_its_unit_and_state_class_are_ones_ha_accepts() {
-        // Home Assistant rejects an invalid device_class/unit pair at discovery
-        // and never creates the entity — a silent loss with only a log line —
-        // and warns about an impossible device_class/state_class pair. These
-        // are its own tables, so a wrong combination fails here rather than on
-        // the running system.
+        // Home Assistant rejects an invalid device_class/unit pair at
+        // discovery and never creates the entity: a silent loss with only a
+        // log line. It warns about an impossible device_class/state_class
+        // pair. These tables copy its own, so a wrong combination fails
+        // here rather than on the running system.
         const DEVICE_CLASS_RULES: &[(&str, &[&str], &[&str])] = &[
             (
                 "power",
@@ -639,9 +641,9 @@ mod tests {
     fn given_a_discovery_message_when_announced_then_it_does_not_set_has_entity_name() {
         // `has_entity_name` is not an MQTT discovery option: the integration
         // hardcodes it True on every entity, and the discovery schema drops
-        // unknown keys silently (extra=vol.REMOVE_EXTRA). Publishing it would
-        // read as configuration while doing nothing at all, so its absence is
-        // deliberate and worth pinning.
+        // unknown keys silently (extra=vol.REMOVE_EXTRA). To publish it
+        // would read as configuration while it does nothing, so its absence
+        // is deliberate and this test pins it.
         let mut payloads: Vec<serde_json::Value> = SENSORS
             .iter()
             .map(|spec| discovery_for(spec.object_id))
@@ -666,9 +668,9 @@ mod tests {
 
     #[test]
     fn given_the_state_payload_when_read_by_the_templates_then_every_sensor_finds_its_field() {
-        // The discovery configs and the state payload are edited in different
-        // places, so this checks the JSON key each value_template reads is
-        // actually published.
+        // Different code builds the discovery configs and the state
+        // payload, so this test checks that the state payload publishes the
+        // JSON key that each value_template reads.
         let payload = payload_of(KeiserStats::default());
 
         for spec in SENSORS {

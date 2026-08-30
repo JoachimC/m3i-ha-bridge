@@ -2,9 +2,8 @@
 //! exposes: FTMS Indoor Bike Data, Cycling Power Measurement and Heart Rate
 //! Measurement.
 //!
-//! Kept free of any BlueZ/bluer dependency so the wire formats can be
-//! unit-tested on every platform, even though the GATT server itself only
-//! runs on Linux.
+//! This module has no BlueZ/bluer dependency, so unit tests check the wire
+//! formats on every platform. The GATT server itself only runs on Linux.
 
 use tokio::time::Instant;
 
@@ -23,9 +22,10 @@ use crate::stats::{Sanitized, Tenths};
 /// Machine Control Point, so no Supported \*Range characteristics are required
 /// (Table 4.1, conditions C.1–C.5).
 ///
-/// Lives here rather than beside the characteristic in `gatt_server.rs` because
-/// that module is `cfg(target_os = "linux")` — a test next to it would silently
-/// never run on a macOS dev machine.
+/// This constant lives here, not beside the characteristic in
+/// `gatt_server.rs`, because that module is `cfg(target_os = "linux")`: a
+/// test in that module never runs on a macOS dev machine, and no warning
+/// shows this.
 pub const FTMS_FEATURE_VALUE: [u8; 8] = [0x86, 0x54, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 
 /// Indoor Bike Data flags (FTMS v1.0 §4.9.1): Cadence (bit 2), Total Distance
@@ -56,7 +56,7 @@ pub fn serialize_ftms(stats: &Sanitized) -> Vec<u8> {
 }
 
 /// Cycling Power Measurement (0x2A63): power, then the crank revolution data
-/// the flags declare. Both counters roll over at u16, per spec.
+/// the flags declare. Both counters wrap at u16, per the spec.
 pub fn serialize_cps(stats: &Sanitized, revolutions: u16, event_time: u16) -> Vec<u8> {
     let mut data = Vec::with_capacity(8);
     data.extend_from_slice(&CPS_MEASUREMENT_FLAGS.to_le_bytes());
@@ -104,18 +104,18 @@ fn heart_rate_bpm(heart_rate: Tenths) -> u8 {
 }
 
 /// The first payload to send a client that has just subscribed to a notify
-/// characteristic, or `None` when that characteristic has nothing worth
-/// reporting yet.
+/// characteristic, or `None` when that characteristic has no value to
+/// report yet.
 ///
-/// The order here is the point: the stats are sanitized *before* `has_value`
-/// inspects them, not just before serialization. Predicates like `power > 0`
-/// evaluated on the raw watch value fire precisely in the stale case — a client
-/// subscribing an hour after a ride would be told the last live power, cadence
-/// and heart rate, and for Cycling Power that reading would also accrue crank
-/// revolutions across the whole idle gap.
+/// The order is important: the function sanitizes the stats *before*
+/// `has_value` inspects them, not only before serialization. A predicate
+/// like `power > 0` on the raw watch value fires exactly in the stale case.
+/// A client that subscribes an hour after a ride would receive the last
+/// live power, cadence and heart rate. For Cycling Power, that reading
+/// would also accumulate crank revolutions across the whole idle gap.
 ///
-/// `serialize` is therefore only invoked when something is actually being sent,
-/// which keeps the stateful CPS serializer from advancing on a skipped send.
+/// The function therefore invokes `serialize` only when it sends something,
+/// so the stateful CPS serializer does not advance on a skipped send.
 pub fn initial_notification(
     reading: &crate::stats::Reading,
     has_value: fn(&Sanitized) -> bool,
@@ -125,9 +125,9 @@ pub fn initial_notification(
     has_value(&stats).then(|| serialize(&stats))
 }
 
-// Whether each characteristic has anything worth sending a new subscriber.
-// All three gate on a live metric, which is exactly what `sanitized` zeroes,
-// so staleness silences every one of them.
+// Whether each characteristic has a value to send a new subscriber. All
+// three test a live metric, and `sanitized` zeroes exactly those metrics,
+// so stale stats disable all three.
 
 pub fn ftms_has_value(stats: &Sanitized) -> bool {
     stats.power > 0 || stats.cadence.is_positive()
@@ -141,9 +141,10 @@ pub fn hrs_has_value(stats: &Sanitized) -> bool {
     stats.heart_rate.is_positive()
 }
 
-/// Cycling Power is stateful: it reports cumulative crank revolutions and the
-/// time of the last crank event in 1/1024 s, both wrapping at u16 per spec.
-/// One accumulator per subscriber, advanced on every notification.
+/// Cycling Power is stateful: it reports cumulative crank revolutions and
+/// the time of the last crank event in 1/1024 s, both wrapping at u16 per
+/// the spec. Each subscriber has one accumulator, and every notification
+/// advances it.
 #[derive(Debug)]
 pub struct CrankAccumulator {
     revolutions: f64,
@@ -175,10 +176,11 @@ impl CrankAccumulator {
     }
 }
 
-/// Converts an accumulating counter to the wrapping u16 the CPS spec expects.
-/// A plain `as u16` cast saturates at 65535 (freezing the value — for the
-/// crank event time that happens after only 64 seconds at 1024 ticks/s),
-/// whereas clients rely on modulo-65536 rollover to compute deltas.
+/// Converts an accumulating counter to the wrapping u16 that the CPS spec
+/// expects. A plain `as u16` cast saturates at 65535, and the value then
+/// stays constant; for the crank event time this occurs after only 64
+/// seconds at 1024 ticks/s. Clients rely on modulo-65536 rollover to
+/// compute deltas.
 pub fn wrap_u16(value: f64) -> u16 {
     (value.max(0.0) % 65536.0) as u16
 }
@@ -273,10 +275,10 @@ mod tests {
             "no Control Point, so no Target Setting Features"
         );
 
-        // FTMS v1.0 §4.9.1, Table 4.10: Indoor Bike Data flag bit -> the
-        // Fitness Machine Feature bit that must be set to be allowed to send
-        // that field. Bit 0 (More Data) has no corresponding feature bit, which
-        // is why sending the mandatory Instantaneous Speed needs none.
+        // FTMS v1.0 §4.9.1, Table 4.10: each Indoor Bike Data flag bit maps
+        // to the Fitness Machine Feature bit that permits that field. Bit 0
+        // (More Data) has no corresponding feature bit, so the mandatory
+        // Instantaneous Speed needs none.
         const FLAG_TO_FEATURE: [(u32, u32); 12] = [
             (1, 0),   // Average Speed Present    -> Average Speed Supported
             (2, 1),   // Instantaneous Cadence    -> Cadence Supported
@@ -292,10 +294,11 @@ mod tests {
             (12, 13), // Remaining Time Present   -> Remaining Time Supported
         ];
 
-        // Derived from the flags the serializer actually emits rather than
-        // restated as a literal, so the two can never drift apart: adding a
-        // field to serialize_ftms without declaring it fails here, and so does
-        // declaring a feature that is never sent.
+        // The test derives the required features from the flags that the
+        // serializer emits; it does not restate them as a literal. The two
+        // therefore always agree: the test fails when serialize_ftms adds a
+        // field with no declared feature, and also when the value declares a
+        // feature that the serializer never sends.
         let data = serialize_ftms(&sanitized());
         let flags = le_u16(&data, 0) as u32;
         let required = FLAG_TO_FEATURE
@@ -326,8 +329,8 @@ mod tests {
         assert_eq!(data, vec![0x00, 120]);
     }
 
-    /// The state a bridge sits in between rides: real values were received,
-    /// but long enough ago that they must not be reported as current.
+    /// The bridge state between rides: real values arrived, but so long ago
+    /// that the bridge must not report them as current.
     fn stale_reading() -> Reading {
         Reading {
             stats: stats(),
@@ -346,9 +349,9 @@ mod tests {
 
     #[test]
     fn given_stale_stats_when_the_initial_notification_is_built_then_nothing_is_sent() {
-        // Evaluated on the raw reading, `power > 0` fires *precisely* when it
-        // is too old to send: a client subscribing an hour after a ride would
-        // be handed the last live power, cadence and heart rate.
+        // On the raw reading, `power > 0` fires *precisely* when the value
+        // is too old to send: a client that subscribes an hour after a ride
+        // would receive the last live power, cadence and heart rate.
         let mut serialize = serialize_ftms;
         assert!(initial_notification(&stale_reading(), ftms_has_value, &mut serialize).is_none());
     }
@@ -366,9 +369,9 @@ mod tests {
     #[test]
     fn given_stale_stats_when_the_initial_notification_is_built_then_the_serializer_is_not_called()
     {
-        // The Cycling Power serializer is stateful. Calling it on a skipped
-        // send would advance cumulative crank revolutions across the whole idle
-        // gap, so the decision has to come before serialization, not after.
+        // The Cycling Power serializer is stateful. A call on a skipped send
+        // would advance cumulative crank revolutions across the whole idle
+        // gap, so the decision must come before serialization, not after.
         let mut calls = 0;
         let mut serialize = |stats: &Sanitized| {
             calls += 1;
@@ -380,8 +383,8 @@ mod tests {
 
     #[test]
     fn given_stale_stats_when_any_characteristic_decides_then_none_reports_a_value() {
-        // All three characteristics gate on a live metric, and `sanitized`
-        // zeroes exactly those three, so staleness silences every one of them.
+        // All three characteristics test a live metric, and `sanitized`
+        // zeroes exactly those three, so stale stats disable every one.
         let stale = stale_reading().sanitized();
         assert!(!ftms_has_value(&stale), "Indoor Bike Data");
         assert!(!cps_has_value(&stale), "Cycling Power");
@@ -421,7 +424,7 @@ mod tests {
         assert_eq!(wrap_u16(65535.0), 65535);
         assert_eq!(wrap_u16(65536.0), 0);
         assert_eq!(wrap_u16(65536.0 + 100.0), 100);
-        // A 30-minute ride at 1024 ticks/s must keep rolling over, not freeze.
+        // A 30-minute ride at 1024 ticks/s must continue to wrap, not saturate.
         assert_eq!(
             wrap_u16(30.0 * 60.0 * 1024.0),
             ((30_u32 * 60 * 1024) % 65536) as u16

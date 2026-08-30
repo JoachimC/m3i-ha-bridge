@@ -1,10 +1,10 @@
-//! Turns the process's termination signals into one cancellation token.
+//! Converts the process's termination signals into one cancellation token.
 
 use tokio_util::sync::CancellationToken;
 
-/// A token that is cancelled when the process is asked to stop.
+/// Returns a token that a termination signal cancels.
 ///
-/// SIGTERM is what systemd sends; SIGINT and SIGQUIT cover a terminal.
+/// systemd sends SIGTERM; SIGINT and SIGQUIT come from a terminal.
 pub fn on_signal() -> CancellationToken {
     let cancel_token = CancellationToken::new();
     let token_clone = cancel_token.clone();

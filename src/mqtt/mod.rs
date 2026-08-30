@@ -24,17 +24,19 @@ use crate::stats::{Fleet, next_snapshot};
 use std::sync::Arc;
 
 /// How often the state loop re-evaluates even when no new advertisement
-/// arrived, so a reading going stale is published rather than waited on.
+/// arrived, so it publishes a reading that goes stale rather than waits for
+/// the next advertisement.
 const STATE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Publishes bike state to MQTT until cancelled.
+/// Publishes bike state to MQTT until cancellation.
 ///
-/// Failure policy: retry forever, internally. rumqttc's event loop reconnects
-/// on its own and the driver re-announces on every ConnAck, so a broker being
-/// down is an expected condition rather than a reason to stop — the bridge's
-/// BLE half must keep working regardless. The only abnormal exit is the stats
-/// producer disappearing, which means the process is already broken and is
-/// reported as an error so the exit status says so.
+/// Failure policy: retry forever, internally. rumqttc's event loop
+/// reconnects on its own, and the driver announces again on every ConnAck.
+/// A broker that is down is an expected condition, not a reason to stop:
+/// the bridge's BLE half must continue to work regardless. The only
+/// abnormal exit is a stats producer that disappears. That means the
+/// process is already broken, so the function returns an error and the exit
+/// status shows it.
 pub async fn run(
     cancel_token: CancellationToken,
     mut stats_rx: watch::Receiver<Arc<Fleet>>,
@@ -62,8 +64,8 @@ pub async fn run(
     let (client, eventloop) = AsyncClient::new(options, REQUEST_CHANNEL_CAPACITY);
 
     let ledger = Qos1Ledger::default();
-    // Bumped by the driver on every ConnAck, so the state loop can re-send
-    // what the broker may have lost.
+    // The driver increments this on every ConnAck, so the state loop can
+    // send again what the broker lost.
     let (connected_tx, mut connected_rx) = watch::channel(0u64);
 
     // The connection driver is the sole poller of the event loop, which is also

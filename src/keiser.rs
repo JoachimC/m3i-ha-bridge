@@ -2,12 +2,13 @@
 //!
 //! The bike broadcasts its state in the Manufacturer Data field of BLE
 //! advertisements; see `doc/bluetooth-protocol.md` for the packet layout.
-//! This module is deliberately free of any Bluetooth stack dependency so the
-//! protocol logic can be unit-tested on any platform, and it does no logging:
-//! it says *why* a payload was rejected and leaves the reporting to the
-//! caller, which knows how often the same beacon will be seen again.
+//! This module has no Bluetooth stack dependency, so the protocol logic has
+//! unit tests that run on any platform. It does no logging: it reports *why*
+//! it rejected a payload, and the caller does the reporting. The caller knows
+//! how often the same beacon appears again.
 //!
-//! Only new firmware (6.21+, 17-byte payload) and metric units are supported.
+//! The parser supports only new firmware (6.21+, 17-byte payload) and metric
+//! units.
 
 use std::fmt;
 
@@ -19,28 +20,28 @@ use crate::stats::{BikeId, KeiserStats, Tenths, Version};
 /// On air the two prefix bytes are `02 01` (Core Spec CSS Part A §1.4: the
 /// company id is the first two octets of AD type 0xFF, little-endian). BlueZ
 /// decodes that to `0x0102` and strips it from the payload (`src/eir.c`,
-/// `eir_parse_msd`), which is why this parser's offsets start at the firmware
-/// major byte rather than at the prefix. 0x0201, 0x01AA and 0x015E are AR
-/// Timing, Geophysical Technology and Unikey Technologies — unrelated to
-/// Keiser, and 0x0201 can never reach this parser.
+/// `eir_parse_msd`). Because of that strip, this parser's offsets start at
+/// the firmware major byte, not at the prefix. 0x0201, 0x01AA and 0x015E
+/// belong to AR Timing, Geophysical Technology and Unikey Technologies, not
+/// to Keiser. 0x0201 can never reach this parser.
 pub const MANUFACTURER_ID: u16 = 0x0102;
 
 /// Length of the manufacturer-data payload after BlueZ strips the company id.
-/// Firmware 6.21 is the first build to append the trailing Gear byte, which is
-/// what makes it 17.
+/// Firmware 6.21 is the first build that appends the trailing Gear byte; that
+/// byte makes the length 17.
 pub const PAYLOAD_LEN: usize = 17;
 
-/// Keiser's own parser gates the gear field on the same `>= 21`. See
+/// Keiser's own parser also requires `>= 21` for the gear field. See
 /// [`decode_version_byte`] for the byte encoding.
 const MIN_SUPPORTED_VERSION: Version = Version {
     major: 6,
     minor: 21,
 };
 
-/// Byte 2 is a data-slot index. `0x00` carries live real-time data and `0xFF`
-/// means the ride is paused; every other value indexes one of the review /
-/// summary records the bike broadcasts after a ride, which must not be
-/// republished as current readings.
+/// Byte 2 is a data-slot index. `0x00` carries live real-time data, and
+/// `0xFF` means the ride is paused. Every other value indexes one of the
+/// review or summary records that the bike broadcasts after a ride. The
+/// bridge must not republish those records as current readings.
 const REALTIME_DATA_SLOT: u8 = 0x00;
 const PAUSED_DATA_SLOT: u8 = 0xFF;
 
@@ -48,12 +49,12 @@ const PAUSED_DATA_SLOT: u8 = 0xFF;
 const METRIC_FLAG: u16 = 0x8000;
 const DISTANCE_VALUE_MASK: u16 = 0x7FFF;
 
-/// Why a manufacturer-data payload was not decoded as a reading.
+/// Why the parser did not decode a manufacturer-data payload as a reading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rejection {
     /// Shorter than [`PAYLOAD_LEN`].
     TooShort(usize),
-    /// A version byte that is not BCD; the raw bytes are reported.
+    /// A version byte that is not BCD; the rejection carries the raw bytes.
     UnrecognisedVersion(u8, u8),
     /// Firmware before 6.21 has no gear byte and a different layout.
     OldFirmware(Version),
@@ -64,8 +65,8 @@ pub enum Rejection {
 }
 
 impl Rejection {
-    /// Whether this says something about the bike (persistently unsupported)
-    /// rather than about one packet. The caller reports these more loudly.
+    /// True when the rejection describes the bike (persistently unsupported),
+    /// not one packet. The caller reports these at a higher log level.
     pub fn is_unsupported_bike(&self) -> bool {
         matches!(
             self,
@@ -96,13 +97,13 @@ impl fmt::Display for Rejection {
 /// Decodes one of the two firmware-version bytes.
 ///
 /// The version bytes are **BCD**: each nibble is one decimal digit of the
-/// version segment, so `0x24` is version 24 (not 36) and `0x21` is version 21
-/// (not 33). Every other field in the packet is plain binary — the quirk is
-/// unique to these two bytes, because the firmware writes the decimal digits
-/// into the byte without converting to hex first.
+/// version segment. So `0x24` is version 24 (not 36), and `0x21` is version
+/// 21 (not 33). Every other field in the packet is plain binary. Only these
+/// two bytes are special, because the firmware writes the decimal digits
+/// into the byte and does not convert them to hex first.
 ///
-/// Authority: Keiser's official parser does the same conversion literally —
-/// render the byte as hex, then read that text back as decimal
+/// Authority: Keiser's official parser does the same literal conversion — it
+/// renders the byte as hex, then reads that text as decimal
 /// (<https://github.com/KeiserCorp/Keiser.MSeries.BLE-Parser>,
 /// `Keiser.M3i.BLE-Parser/Parser.cs`, `BuildValueConvert`):
 ///
@@ -112,12 +113,12 @@ impl fmt::Display for Rejection {
 /// Int32.TryParse(value.ToString("X"), out converted);
 /// ```
 ///
-/// Corroborated by Keiser's parse example at <https://dev.keiser.com/mseries/direct/>
-/// (byte `30` = version 30, i.e. firmware 6.30) and by Keiser's own M3i
-/// simulator, which broadcasts `MAJOR="06" MINOR="24"` as raw hex bytes.
+/// Keiser's parse example at <https://dev.keiser.com/mseries/direct/>
+/// confirms this (byte `30` = version 30, i.e. firmware 6.30). Keiser's own
+/// M3i simulator also broadcasts `MAJOR="06" MINOR="24"` as raw hex bytes.
 ///
 /// Returns `None` if either nibble is not a decimal digit; Keiser's parser
-/// likewise fails to convert such a byte (`TryParse` leaves it 0).
+/// also fails to convert such a byte (`TryParse` leaves it 0).
 fn decode_version_byte(byte: u8) -> Option<u8> {
     let (tens, units) = (byte >> 4, byte & 0x0F);
     (tens <= 9 && units <= 9).then_some(tens * 10 + units)
@@ -271,9 +272,9 @@ mod tests {
 
     #[test]
     fn given_bcd_version_bytes_when_decoded_then_each_nibble_is_a_decimal_digit() {
-        // The version bytes are BCD, NOT plain binary. Under a binary reading
-        // 0x24 would be 36 and 0x30 would be 48, so any "fix" in that
-        // direction fails here.
+        // The version bytes are BCD, NOT plain binary. A binary reading gives
+        // 36 for 0x24 and 48 for 0x30, so a "fix" in that direction fails
+        // here.
         assert_eq!(decode_version_byte(0x06), Some(6));
         assert_eq!(decode_version_byte(0x21), Some(21), "the gate, not 33");
         assert_eq!(
@@ -304,9 +305,9 @@ mod tests {
 
     #[test]
     fn given_every_valid_bcd_byte_when_decoded_then_ordering_is_preserved() {
-        // Why the minimum version can be compared as decoded digits: for
-        // valid BCD, raw-byte order equals decoded-decimal order, so the two
-        // readings can never disagree.
+        // Why the parser can compare the minimum version as decoded digits:
+        // for valid BCD, raw-byte order equals decoded-decimal order, so the
+        // two readings can never disagree.
         let decoded: Vec<(u8, u8)> = (0..=0xFFu8)
             .filter_map(|byte| decode_version_byte(byte).map(|value| (byte, value)))
             .collect();
@@ -348,8 +349,9 @@ mod tests {
     #[test]
     fn given_review_record_slot_when_parsed_then_the_rejection_names_the_slot() {
         // Slots other than 0x00 (real-time) and 0xFF (paused) index the
-        // review/summary records broadcast after a ride; republishing those
-        // as live readings would report a finished ride as current.
+        // review or summary records that the bike broadcasts after a ride.
+        // A bridge that republishes those as live readings reports a
+        // finished ride as current.
         for slot in [0x01, 0x02, 0x7F, 0xFE] {
             let mut data = LIVE_CAPTURE;
             data[2] = slot;

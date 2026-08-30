@@ -12,9 +12,9 @@ pub enum Wait {
 
 /// Decides the pause before the next attempt.
 pub trait RetryDelay {
-    /// Waits before the next attempt. `last_attempt` is how long the attempt
-    /// that just ended ran, so the strategy can tell a fresh failure after
-    /// hours of health from the next failure in a run of them.
+    /// Waits before the next attempt. `last_attempt` is the duration of the
+    /// attempt that just ended. With it, the strategy can separate a fresh
+    /// failure after hours of health from the next failure in a sequence.
     fn wait(
         &mut self,
         last_attempt: Duration,
@@ -24,21 +24,21 @@ pub trait RetryDelay {
 
 /// Exponential backoff with jitter.
 ///
-/// A fixed short delay is right while a failure looks transient, but the
+/// A fixed short delay is correct while a failure looks transient. But the
 /// adapter-missing case never resolves on its own: the bridge logs an error,
 /// waits, fails identically, and repeats forever. At five seconds that is
-/// seventeen thousand identical log lines a day, on a box whose journal lives
-/// on an SD card. Doubling to a cap keeps the first retry fast — which is what
-/// matters for a transient fault — while making a permanent one cheap to leave
-/// running until someone can look at it.
+/// seventeen thousand identical log lines each day, on a device that keeps
+/// its journal on an SD card. The delay doubles up to a cap. This keeps the
+/// first retry fast, which is what matters for a transient fault, and makes
+/// a permanent fault cheap until someone can examine it.
 pub struct Backoff {
     initial: Duration,
     max: Duration,
-    /// An attempt that ran at least this long was talking to a working
-    /// adapter, so whatever went wrong is a fresh problem rather than a
-    /// continuation of an earlier one: the schedule starts over instead of
-    /// inheriting a backoff built up hours ago. The adapter-missing case fails
-    /// in milliseconds and so never qualifies, which is the whole point.
+    /// An attempt that ran at least this long used a working adapter, so the
+    /// fault is a fresh problem, not a continuation of an earlier one. The
+    /// schedule then restarts and does not inherit a backoff from hours ago.
+    /// The adapter-missing case fails in milliseconds and so never qualifies;
+    /// that exclusion is the purpose of this threshold.
     healthy_after: Duration,
     /// Fraction of each delay that jitter may remove, e.g. `0.1` for "up to
     /// 10% shorter".
@@ -48,9 +48,9 @@ pub struct Backoff {
     rng: u64,
 }
 
-/// Up to 10% off each delay. With a single bridge there is no thundering herd
-/// to spread, but it keeps the retries from locking in step with anything else
-/// that restarts on the same timer — bluetoothd, most obviously.
+/// Jitter removes up to 10% of each delay. A single bridge causes no
+/// thundering herd, but jitter prevents retries in lockstep with other
+/// processes that restart on the same timer — bluetoothd, most obviously.
 const DEFAULT_JITTER: f64 = 0.1;
 
 impl Backoff {
@@ -75,7 +75,8 @@ impl Backoff {
         }
     }
 
-    /// The delay for the attempt that just ended, advancing the schedule.
+    /// Returns the delay after the attempt that just ended, and advances the
+    /// schedule.
     fn next_delay(&mut self, last_attempt: Duration) -> Duration {
         if last_attempt >= self.healthy_after {
             self.next = self.initial;
@@ -103,9 +104,9 @@ fn nonzero_seed(seed: u64) -> u64 {
 
 /// Shortens `base` by up to `fraction` of itself.
 ///
-/// Jitter only ever subtracts, so a jittered delay can never exceed the cap or
-/// the delay actually scheduled — worth keeping true, because "at most `max`"
-/// is easier to reason about than "roughly `max`".
+/// Jitter only subtracts, so a jittered delay can never exceed the cap or
+/// the scheduled delay. This property is worth keeping, because "at most
+/// `max`" is easier to reason about than "roughly `max`".
 fn apply_jitter(base: Duration, fraction: f64, random: u64) -> Duration {
     if fraction <= 0.0 {
         return base;
@@ -113,16 +114,16 @@ fn apply_jitter(base: Duration, fraction: f64, random: u64) -> Duration {
     base.mul_f64(1.0 - fraction.clamp(0.0, 1.0) * unit_interval(random))
 }
 
-/// A uniform value in [0, 1) from the top 53 bits — an f64 mantissa's worth —
-/// so there are no rounding surprises.
+/// A uniform value in [0, 1) from the top 53 bits — the size of an f64
+/// mantissa — so the conversion to f64 is exact.
 fn unit_interval(random: u64) -> f64 {
     const MANTISSA_BITS: u32 = 53;
     (random >> (u64::BITS - MANTISSA_BITS)) as f64 / (1u64 << MANTISSA_BITS) as f64
 }
 
-/// xorshift64*. Spreading retry delays is all this is for; it is not suitable
-/// for anything that cares about randomness, but it avoids a dependency on a
-/// binary that is being trimmed for an armv6 Pi Zero.
+/// xorshift64*. Its only purpose is to spread retry delays; it is not
+/// suitable for work that needs real randomness. It avoids one more
+/// dependency in a binary that must stay small for an armv6 Pi Zero.
 fn next_random(state: &mut u64) -> u64 {
     let mut x = *state;
     x ^= x >> 12;
@@ -148,8 +149,8 @@ mod tests {
     /// An attempt that failed at once: the adapter-missing case.
     const IMMEDIATE: Duration = Duration::ZERO;
 
-    /// Jitter off, so the schedule is exact and the assertions are about
-    /// backoff rather than about the PRNG.
+    /// Jitter is off, so the schedule is exact and the assertions test the
+    /// backoff, not the PRNG.
     fn backoff() -> Backoff {
         Backoff::with_seed(INITIAL, MAX, HEALTHY, 0.0, 1)
     }
@@ -185,8 +186,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_repeated_failures_when_waiting_then_each_delay_doubles_up_to_the_cap() {
-        // An adapter that is simply absent must not keep costing a log line
-        // every five seconds forever.
+        // An absent adapter must not cost a log line every five seconds
+        // forever.
         let mut strategy = backoff();
         let expected = [5, 10, 20, 40, 60, 60, 60].map(Duration::from_secs);
 
@@ -200,8 +201,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn given_a_backed_off_strategy_when_an_attempt_ran_healthily_then_the_delay_starts_over()
     {
-        // A bridge that ran for hours before failing should retry promptly,
-        // not inherit the cap from a bad spell days earlier.
+        // A bridge that ran for hours before a failure must retry promptly,
+        // and must not inherit the cap from a fault sequence days earlier.
         let mut strategy = backoff();
         for _ in 0..5 {
             strategy.wait(IMMEDIATE, CancellationToken::new()).await;
@@ -226,8 +227,8 @@ mod tests {
 
     #[test]
     fn given_jitter_when_applied_then_it_only_ever_shortens_the_delay() {
-        // Never lengthening is what keeps the cap a real bound rather than an
-        // approximate one.
+        // Because jitter never lengthens a delay, the cap stays a real bound,
+        // not an approximate one.
         let mut rng = 12345;
         for _ in 0..1000 {
             let jittered = apply_jitter(MAX, DEFAULT_JITTER, next_random(&mut rng));
@@ -246,8 +247,8 @@ mod tests {
 
     #[test]
     fn given_a_run_of_delays_when_jittered_then_they_actually_differ() {
-        // Guards the guard: a jitter that always returned the base would pass
-        // the bounds test above while spreading nothing.
+        // Guards the guard: a jitter that always returns the base passes the
+        // bounds test above and spreads nothing.
         let mut rng = 12345;
         let delays: Vec<Duration> = (0..10)
             .map(|_| apply_jitter(MAX, DEFAULT_JITTER, next_random(&mut rng)))

@@ -18,22 +18,22 @@ impl Topics {
     }
 
     /// Whether the *bridge* is running: the last will lives here, so a crash
-    /// takes every bike's entities offline at once.
+    /// sets every bike's entities offline at once.
     pub fn bridge_availability(&self) -> String {
         format!("{}/availability", self.prefix)
     }
 
-    /// Whether one *bike* is being heard: `offline` once its readings go
-    /// stale, so a bike that has been switched off greys out in Home Assistant
+    /// Whether the bridge hears one *bike*: `offline` once its readings go
+    /// stale, so a powered-off bike shows unavailable in Home Assistant
     /// while the bridge, and the other bikes, stay online.
     pub fn bike_availability(&self, bike_id: BikeId) -> String {
         format!("{}/{bike_id}/availability", self.prefix)
     }
 
-    /// Node id used in Home Assistant discovery topics; must not contain '/'.
+    /// Node id for Home Assistant discovery topics; must not contain '/'.
     ///
     /// Deliberately independent of the topic prefix: the same physical bike
-    /// heard by two bridges on one broker is one device, not two.
+    /// that two bridges hear on one broker is one device, not two.
     pub fn node_id(&self, bike_id: BikeId) -> String {
         format!("m3i-ha-bridge-{bike_id}")
     }

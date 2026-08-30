@@ -1,5 +1,5 @@
 //! BLE GATT server on BlueZ: the standard fitness services, and the
-//! [`Advertiser`] that puts the advertising policy of `advertising` on the air.
+//! [`Advertiser`] that broadcasts the advertising policy of `advertising`.
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
@@ -50,33 +50,36 @@ mod linux_impl {
     const DIS_MODEL_NUMBER_CHAR_UUID: bluer::Uuid = uuid(0x2a24);
     const DIS_SERIAL_NUMBER_CHAR_UUID: bluer::Uuid = uuid(0x2a25);
 
-    /// How often each notify loop re-sends the current stats even when no new
-    /// advertisement arrived, so clients see values decay to zero on staleness.
+    /// How often each notify loop sends the current stats again when no new
+    /// advertisement arrived, so clients see values decay to zero when a
+    /// reading becomes stale.
     const NOTIFY_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
-    /// Advertising interval range asked of BlueZ; dropped on retry, since
-    /// some controllers reject custom intervals outright.
+    /// The advertising interval range that the bridge requests from BlueZ.
+    /// Retries omit it, because some controllers reject custom intervals.
     const ADVERTISING_MIN_INTERVAL: Duration = Duration::from_millis(300);
     const ADVERTISING_MAX_INTERVAL: Duration = Duration::from_millis(500);
-    /// D-Bus registration attempts before falling back to btmgmt, and the
-    /// pause between them.
+    /// The number of D-Bus registration attempts before the btmgmt
+    /// fallback, and the pause between them.
     const ADVERTISING_ATTEMPTS: usize = 5;
     const ADVERTISING_RETRY_DELAY: Duration = Duration::from_millis(500);
 
-    /// Time given to BlueZ between unregistering one advertisement and
-    /// registering the next.
+    /// Time that the bridge gives BlueZ between the unregistration of one
+    /// advertisement and the registration of the next.
     ///
-    /// Dropping a bluer `AdvertisementHandle` does not unregister anything
+    /// A drop of a bluer `AdvertisementHandle` does not unregister anything
     /// synchronously: it signals a spawned task, which then sends
     /// `UnregisterAdvertisement` over D-Bus. Without a pause, the new
-    /// `RegisterAdvertisement` can reach bluetoothd while the old instance is
-    /// still live, fail with a generic D-Bus error, exhaust the retries and
-    /// drop into the btmgmt fallback for a switch that would have worked a
-    /// moment later. Same idiom as `SCAN_SETTLE_DELAY` in `scan_bluer.rs`.
+    /// `RegisterAdvertisement` can reach bluetoothd while the old instance
+    /// is still live. The call then fails with a generic D-Bus error,
+    /// exhausts the retries, and uses the btmgmt fallback for a switch that
+    /// would succeed a moment later. `SCAN_SETTLE_DELAY` in
+    /// `scan_btleplug.rs` follows the same pattern.
     const ADVERTISING_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
-    /// Time given to BlueZ to process the GATT application's unregistration
-    /// before the process exits — asynchronous for the same reason.
+    /// Time for BlueZ to process the GATT application's unregistration
+    /// before the process exits; the operation is asynchronous for the same
+    /// reason.
     const GATT_UNREGISTER_SETTLE_DELAY: Duration = Duration::from_secs(1);
 
     const BTMGMT: &str = "/usr/bin/btmgmt";
@@ -84,16 +87,17 @@ mod linux_impl {
     const BTMGMT_INSTANCE: &str = "1";
 
     /// Serves a subscriber of one notify characteristic: sends the current
-    /// stats immediately (when `has_value` says they are worth sending), then
-    /// re-serializes and notifies on every stats change or poll tick until the
-    /// client disconnects or the stats sender is dropped.
+    /// stats immediately (when `has_value` approves them), then serializes
+    /// and notifies again on every stats change or poll tick. The loop ends
+    /// when the client disconnects or the stats sender drops.
     ///
-    /// Only the advertised bike's reading goes out — the client paired to a
-    /// named bike, and the snapshot carries every bike in range. Re-sending
-    /// that reading on every tick is what lets it decay to zero on staleness.
+    /// The loop sends only the advertised bike's reading: the client paired
+    /// to a named bike, and the snapshot carries every bike in range. The
+    /// send on every tick lets the reading decay to zero when it becomes
+    /// stale.
     ///
-    /// Every payload it sends, the first one included, is built from sanitized
-    /// stats — see [`initial_notification`].
+    /// The loop builds every payload, the first one included, from
+    /// sanitized stats — see [`initial_notification`].
     fn spawn_notify_loop<F>(
         name: &'static str,
         mut rx: watch::Receiver<Arc<Fleet>>,
@@ -107,9 +111,9 @@ mod linux_impl {
         tokio::spawn(async move {
             tracing::info!("GATT: Client subscribed to {}", name);
 
-            // The advertised id is read fresh each time and the guard dropped
-            // before any await; the channel is a shared cell here, not a
-            // stream.
+            // The closure reads the advertised id fresh each time and drops
+            // the guard before any await; the channel is a shared cell here,
+            // not a stream.
             let advertised =
                 |advertised_id: &watch::Receiver<Option<BikeId>>| *advertised_id.borrow();
 
@@ -143,7 +147,7 @@ mod linux_impl {
         }
     }
 
-    /// A readable characteristic whose value is produced on every read.
+    /// A readable characteristic; each read produces a fresh value.
     fn read_characteristic(
         uuid: bluer::Uuid,
         value: impl Fn() -> Vec<u8> + Send + Sync + 'static,
@@ -279,11 +283,11 @@ mod linux_impl {
     enum AdvertisingHandle {
         /// Dropping the handle unregisters it.
         DBus(AdvertisementHandle),
-        /// Registered through `btmgmt add-adv`; needs `rm-adv` to remove.
+        /// `btmgmt add-adv` registered it; `rm-adv` removes it.
         Btmgmt,
     }
 
-    /// Puts advertisements on the air through BlueZ, with the btmgmt fallback.
+    /// Broadcasts advertisements through BlueZ, with the btmgmt fallback.
     struct BluerAdvertiser {
         adapter: bluer::Adapter,
         current: Option<AdvertisingHandle>,
@@ -314,9 +318,9 @@ mod linux_impl {
         }
     }
 
-    /// Registers the advertisement under `name` via D-Bus, falling back to
-    /// `btmgmt` — advertising registration on this hardware is fragile enough
-    /// that both are needed.
+    /// Registers the advertisement under `name` via D-Bus, with `btmgmt` as
+    /// the fallback. Advertising registration on this hardware is
+    /// unreliable, so the bridge needs both routes.
     async fn register_advertisement(
         adapter: &bluer::Adapter,
         name: &str,
@@ -341,8 +345,8 @@ mod linux_impl {
     }
 
     /// BlueZ rejects an oversized advertisement with a generic D-Bus error,
-    /// which the retry loop then reports several times without ever saying
-    /// what is wrong. Say it up front instead.
+    /// and the retry loop reports that error several times without the
+    /// cause. This warning states the cause before the first attempt.
     fn warn_if_oversized(name: &str) {
         let payload_size = legacy_advertising_size(name, ADVERTISED_SERVICE_UUIDS.len());
         if payload_size > LEGACY_ADVERTISING_CAPACITY {
@@ -396,14 +400,14 @@ mod linux_impl {
         Err(last_error.expect("at least one attempt was made"))
     }
 
-    /// btmgmt's `-n` flag advertises the adapter's own alias, so the bike's
-    /// name has to be set there first. BlueZ persists the alias on disk;
-    /// [`run`] restores the original at shutdown.
+    /// btmgmt's `-n` flag advertises the adapter's own alias, so this
+    /// function first sets the alias to the bike's name. BlueZ persists the
+    /// alias on disk; [`run`] restores the original at shutdown.
     async fn advertise_via_btmgmt(adapter: &bluer::Adapter, name: &str) -> Result<(), BoxError> {
         if let Err(e) = adapter.set_alias(name.to_string()).await {
             tracing::warn!("Could not set adapter alias to {:?}: {}", name, e);
         }
-        // A previous process that died without cleaning up may have left the
+        // A previous process that died before its cleanup can leave the
         // instance registered.
         let _ = run_btmgmt(&["rm-adv", BTMGMT_INSTANCE]).await;
         let args = btmgmt_add_adv_args();
@@ -426,9 +430,9 @@ mod linux_impl {
 
         let adapter = session.default_adapter().await?;
         adapter.set_powered(true).await?;
-        // The btmgmt fallback renames the adapter, and BlueZ persists that in
-        // /var/lib/bluetooth across restarts and reboots, so remember what to
-        // put back.
+        // The btmgmt fallback renames the adapter, and BlueZ persists that
+        // in /var/lib/bluetooth across restarts and reboots. Record the
+        // original so shutdown can restore it.
         let original_alias = adapter.alias().await?;
 
         tracing::info!(
@@ -465,7 +469,7 @@ mod linux_impl {
         result
     }
 
-    /// Puts the adapter's alias back if the btmgmt fallback changed it.
+    /// Restores the adapter's alias if the btmgmt fallback changed it.
     async fn restore_alias(adapter: &bluer::Adapter, original: &str) {
         match adapter.alias().await {
             Ok(current) if current == original => {}
@@ -506,9 +510,9 @@ mod linux_impl {
 #[cfg(target_os = "linux")]
 pub use linux_impl::run;
 
-/// BlueZ has no cross-platform equivalent: on other platforms the GATT server
-/// is disabled and this parks until cancellation, so the scanner and MQTT
-/// halves of the bridge still run on a dev machine.
+/// BlueZ has no cross-platform equivalent: on other platforms there is no
+/// GATT server, and this function waits until cancellation, so the scanner
+/// and MQTT halves of the bridge still run on a dev machine.
 #[cfg(not(target_os = "linux"))]
 pub async fn run(
     cancel_token: tokio_util::sync::CancellationToken,

@@ -1,5 +1,5 @@
-//! The broker connection: the event-loop driver, what is announced on each
-//! connect, and the shutdown handshake.
+//! The broker connection: the event-loop driver, what the driver announces
+//! on each connect, and the shutdown handshake.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -15,23 +15,23 @@ use super::topics::Topics;
 use crate::stats::{BikeId, Fleet};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
-/// Capacity of rumqttc's request channel — `AsyncClient::new`'s `cap` is
-/// literally the size of the `flume::bounded` queue between the client handles
-/// and the event loop.
+/// Capacity of rumqttc's request channel. `AsyncClient::new`'s `cap` sets
+/// the size of the `flume::bounded` queue between the client handles and
+/// the event loop.
 ///
-/// It has to absorb a whole [`announce`] burst (availability plus one retained
-/// discovery config per entity, per bike heard) alongside the state publishes
-/// that queue up while the event loop is busy reconnecting. Beyond that
-/// `try_publish` rejects rather than blocks, and a dropped retained discovery
-/// config stays missing until the next reconnect. Zero would be a rendezvous
-/// channel, where `try_publish` only succeeds if the event loop happens to be
-/// parked at that exact instant.
+/// The channel must hold a full [`announce`] burst: availability plus one
+/// retained discovery config per entity, per bike heard. It must also hold
+/// the state publishes that wait while the event loop reconnects. When the
+/// channel is full, `try_publish` rejects the message and does not block,
+/// and a rejected retained discovery config stays missing until the next
+/// reconnect. A capacity of zero makes a rendezvous channel: `try_publish`
+/// succeeds only if the event loop waits at that exact instant.
 ///
-/// Sized for two bursts at the worst case — every ordinal id 0–200 heard,
-/// one device-discovery message each — because a flapping connection
-/// announces twice in quick succession, plus one state publish per bike that
-/// may be queued in between. flume grows its queue on demand, so the bound
-/// costs nothing until it is used.
+/// The size covers two bursts at the worst case: every ordinal id 0–200
+/// heard, one device-discovery message each. A flapping connection
+/// announces twice in quick succession, and one state publish per bike can
+/// wait between the bursts. flume grows its queue on demand, so the bound
+/// allocates no memory until messages use it.
 pub(super) const REQUEST_CHANNEL_CAPACITY: usize =
     BURSTS_IN_FLIGHT * ANNOUNCE_BURST + STATE_PUBLISHES_IN_FLIGHT;
 /// Ordinal ids run 0–200 (see `doc/bluetooth-protocol.md`).
@@ -45,13 +45,13 @@ const STATE_PUBLISHES_IN_FLIGHT: usize = MAX_BIKES;
 /// Hard bound on the shutdown handshake: queue the retained `offline` message,
 /// wait for the broker to acknowledge it, then DISCONNECT.
 ///
-/// Well under systemd's default `TimeoutStopSec`; an ordinary shutdown takes
-/// one round trip.
+/// The bound is well below systemd's default `TimeoutStopSec`. A normal
+/// shutdown takes one round trip.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// A message to send. Retained messages (discovery, availability) go out at
-/// QoS 1 so a loss on the wire is retried; state is QoS 0 because the next
-/// reading supersedes it within seconds anyway.
+/// A message to send. Retained messages (discovery, availability) use
+/// QoS 1, so the client retries a message that the wire loses. State uses
+/// QoS 0 because the next reading supersedes it within seconds.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OutgoingMessage {
     pub topic: String,
@@ -80,24 +80,23 @@ impl OutgoingMessage {
     }
 }
 
-/// Accounts for every QoS 1 publish queued for the event loop, from whichever
-/// task queued it, so the driver can tell the shutdown's `offline` message
-/// apart from the rest.
+/// Counts every QoS 1 publish queued for the event loop, from every task
+/// that queues one. The count lets the driver identify the shutdown's
+/// `offline` message among the outgoing publishes.
 ///
-/// rumqttc assigns packet ids inside the event loop, so the offline message's
-/// id can only be learned by watching the outgoing events. The request channel
-/// is FIFO and ids are assigned in dequeue order, so the first outgoing QoS 1
-/// publish that nobody has accounted for is the offline one — the one publish
-/// that is deliberately not recorded here. Without the ledger, a SIGTERM
-/// arriving while retained configs were still in flight would latch onto the
-/// wrong packet id and wait for an acknowledgement that had already been and
-/// gone.
+/// rumqttc assigns packet ids inside the event loop, so only the outgoing
+/// events show the offline message's id. The request channel is FIFO, and
+/// the event loop assigns ids in dequeue order. The first outgoing QoS 1
+/// publish that the ledger did not count is therefore the offline message —
+/// the one publish that no caller records here, deliberately. Without the
+/// ledger, a SIGTERM during in-flight retained configs would select a wrong
+/// packet id and wait for an acknowledgement that already arrived.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Qos1Ledger(Arc<AtomicUsize>);
 
 impl Qos1Ledger {
-    /// Records a QoS 1 publish about to be queued. Recorded *before* queuing:
-    /// the driver may dequeue it before the caller runs again.
+    /// Records a QoS 1 publish. The caller records *before* it queues: the
+    /// driver can dequeue the publish before the caller runs again.
     fn queued(&self) {
         self.0.fetch_add(1, Ordering::SeqCst);
     }
@@ -109,14 +108,14 @@ impl Qos1Ledger {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
     }
 
-    /// A connection error discards whatever was queued for the old
-    /// connection, so their outgoing events will never arrive.
+    /// A connection error discards every publish queued for the old
+    /// connection, so their outgoing events never arrive.
     fn forget_pending(&self) {
         self.0.store(0, Ordering::SeqCst);
     }
 
     /// Whether an outgoing QoS 1 publish is the shutdown's `offline` message
-    /// rather than one someone recorded here.
+    /// rather than one that a caller recorded here.
     fn is_offline_publish(&self, shutting_down: bool) -> bool {
         let accounted_for = self
             .0
@@ -153,32 +152,32 @@ pub(super) fn try_send(
     }
 }
 
-/// Queues the retained `offline` message and waits for the driver to complete
-/// the handshake it triggers.
+/// Queues the retained `offline` message and waits for the driver to
+/// complete the handshake that the message triggers.
 ///
-/// The wait is on the driver task rather than on the connection, because the
-/// driver owns the event loop and is the only thing that can poll it. Bounded
-/// by [`SHUTDOWN_TIMEOUT`]: if the driver is stuck — mid-reconnect-sleep, say —
-/// dropping the connection is better than hanging, and dropping it makes the
-/// broker publish the last will, which carries the same retained `offline`
-/// payload.
+/// The function waits on the driver task, not on the connection, because
+/// the driver owns the event loop and only the driver can poll it.
+/// [`SHUTDOWN_TIMEOUT`] bounds the wait. If the driver is stuck, for
+/// example in its reconnect sleep, the function drops the connection
+/// instead of hanging. The drop makes the broker publish the last will,
+/// which carries the same retained `offline` payload.
 pub(super) async fn shutdown(
     client: &AsyncClient,
     topics: &Topics,
     mut driver: tokio::task::JoinHandle<()>,
 ) {
-    // Queued here rather than inside the driver so it is strictly ordered after
-    // the last state publish. Queuing it is also what wakes the event loop and
-    // starts the handshake.
+    // This function queues the message itself, not the driver, so the
+    // message follows the last state publish in strict order. The queue
+    // operation also wakes the event loop and starts the handshake.
     if let Err(e) = client.try_publish(
         topics.bridge_availability(),
         QoS::AtLeastOnce,
         true,
         "offline",
     ) {
-        // Nothing was queued, so there is nothing to confirm. Dropping the
-        // connection instead lets the broker publish the will — the same
-        // retained "offline" payload — which is the safer end state.
+        // The channel accepted nothing, so there is nothing to confirm.
+        // Dropping the connection lets the broker publish the will — the
+        // same retained "offline" payload — which is the safer end state.
         tracing::warn!("Could not queue MQTT offline message ({e}); relying on the last will");
         driver.abort();
         return;
@@ -196,12 +195,12 @@ pub(super) async fn shutdown(
     }
 }
 
-/// Polls the event loop until cancellation, re-publishing availability and
-/// discovery on every (re)connect, then runs the shutdown handshake.
+/// Polls the event loop until cancellation, publishes availability and
+/// discovery again on every (re)connect, then runs the shutdown handshake.
 ///
-/// Nothing here ever `select!`s against `eventloop.poll()`. That future is not
-/// cancel-safe: dropping it mid-flush leaves a partially written packet in a
-/// buffer that is never cleared. The offline publish queued by [`shutdown`]
+/// Nothing here ever `select!`s against `eventloop.poll()`. That future is
+/// not cancel-safe: a drop in mid-flush leaves a partially written packet
+/// in a buffer that nothing clears. The offline publish from [`shutdown`]
 /// wakes the parked poll by itself, so there is no need to race it.
 pub(super) async fn drive_connection(
     mut eventloop: EventLoop,
@@ -231,8 +230,8 @@ pub(super) async fn drive_connection(
             Ok(_) => {}
             Err(_) if cancel_token.is_cancelled() => return,
             Err(e) => {
-                // Anything queued for the old connection is gone; the next
-                // ConnAck will announce again.
+                // The error discards every publish queued for the old
+                // connection; the driver announces again on the next ConnAck.
                 ledger.forget_pending();
                 tracing::warn!("MQTT connection error: {e}. Retrying in {RECONNECT_DELAY:?}...");
                 tokio::time::sleep(RECONNECT_DELAY).await;
@@ -244,12 +243,13 @@ pub(super) async fn drive_connection(
 /// Waits for the broker to acknowledge the retained `offline` publish, then
 /// sends DISCONNECT and waits for it to reach the socket.
 ///
-/// The order matters. On receiving DISCONNECT the broker discards the last will
-/// without publishing it (MQTT 3.1.1 [MQTT-3.14.4-3]), so disconnecting before
-/// the offline message is acknowledged would suppress the safety net *and* lose
-/// the message it was standing in for, leaving availability stuck at `online`
-/// forever. On any error this just returns; dropping the connection instead
-/// lets the will fire.
+/// The order matters. When the broker receives DISCONNECT, it discards the
+/// last will without publishing it (MQTT 3.1.1 [MQTT-3.14.4-3]). A
+/// disconnect before the broker acknowledges the offline message would
+/// therefore remove the will *and* lose the message that the will backs up.
+/// Availability would then show `online` forever. On any error this
+/// function only returns; the dropped connection then makes the broker
+/// publish the will.
 async fn finish_shutdown(eventloop: &mut EventLoop, client: &AsyncClient, offline_pkid: u16) {
     loop {
         match eventloop.poll().await {
@@ -282,25 +282,26 @@ async fn finish_shutdown(eventloop: &mut EventLoop, client: &AsyncClient, offlin
     }
 }
 
-/// Publishes the bridge's availability and the Home Assistant device-discovery
-/// config of every bike heard so far, returning how many messages were queued.
+/// Publishes the bridge's availability and the Home Assistant
+/// device-discovery config of every bike heard so far. Returns how many
+/// messages the channel accepted.
 ///
-/// A bike's config is first published by the state loop the moment it is
-/// heard; this repeats it on every reconnect, because anything queued for the
-/// old connection is gone and a retained config the broker never received
-/// stays missing.
+/// The state loop first publishes a bike's config the moment it hears the
+/// bike. This function repeats the config on every reconnect: a connection
+/// error discards the queued publishes, and a retained config that the
+/// broker never received stays missing.
 ///
-/// Runs inside the connection driver, which is the only task polling the event
-/// loop, so it must never await a publish. `client.publish(..).await` parks
-/// until the request channel has room, and the only consumer of that channel is
-/// the event loop's `next_request` — reachable only from `poll()`, i.e. from
-/// the very task that would now be parked. That is a permanent deadlock, not a
-/// slow path. `try_publish` never blocks, and [`REQUEST_CHANNEL_CAPACITY`] is
-/// sized to hold a whole burst.
+/// This function runs inside the connection driver, the only task that
+/// polls the event loop, so it must never await a publish.
+/// `client.publish(..).await` parks until the request channel has room. The
+/// only consumer of that channel is the event loop's `next_request`, which
+/// only `poll()` reaches — the same task that the await parks. That is a
+/// permanent deadlock, not a slow path. `try_publish` never blocks, and
+/// [`REQUEST_CHANNEL_CAPACITY`] holds a full burst.
 ///
-/// For the same reason `announce` is not spawned: a spawned task could
-/// interleave its retained configs with a second reconnect's, and with adequate
-/// capacity there is nothing for spawning to buy.
+/// For the same reason, no task spawn wraps `announce`: a spawned task
+/// could interleave its retained configs with a second reconnect's configs,
+/// and with adequate capacity a spawn gives no benefit.
 fn announce(
     client: &AsyncClient,
     ledger: &Qos1Ledger,
@@ -361,15 +362,15 @@ mod tests {
 
     #[test]
     fn given_the_request_channel_when_a_whole_announce_burst_arrives_then_none_is_dropped() {
-        // announce runs inside the poll task, so the event loop is not
-        // draining while the burst is queued. If the burst overflowed the
+        // announce runs inside the poll task, so the event loop does not
+        // drain while the burst queues. If the burst overflowed the
         // channel, a dropped retained discovery config would stay missing
-        // until the next reconnect -- and try_publish only logs.
+        // until the next reconnect -- and try_publish only logs the loss.
         let topics = test_topics();
         let (client, rx) = test_client(REQUEST_CHANNEL_CAPACITY);
 
-        // The worst case: every ordinal id 0–200 has been heard, and the burst
-        // scales with the bikes in range.
+        // The worst case: the bridge heard every ordinal id 0–200, and the
+        // burst scales with the bikes in range.
         let bikes: BTreeSet<BikeId> = (0..=200).map(BikeId).collect();
         assert_eq!(
             bikes.len(),
@@ -382,8 +383,8 @@ mod tests {
             "an announce burst of {burst} cannot fit a channel of {REQUEST_CHANNEL_CAPACITY}"
         );
 
-        // Two bursts back to back, as a flapping connection produces, still fit
-        // in the channel.
+        // Two consecutive bursts, as a flapping connection produces, still
+        // fit in the channel.
         let ledger = Qos1Ledger::default();
         assert_eq!(announce(&client, &ledger, &topics, &bikes), burst);
         assert_eq!(announce(&client, &ledger, &topics, &bikes), burst);
@@ -392,9 +393,9 @@ mod tests {
 
     #[test]
     fn given_a_full_request_channel_when_announcing_then_it_reports_what_it_dropped() {
-        // try_publish never blocks -- which is exactly why it is used inside
-        // the poll task -- so an overflowing burst must be visible in the
-        // return value rather than silently lost.
+        // try_publish never blocks -- which is exactly why the poll task
+        // uses it -- so the return value must show an overflowing burst
+        // rather than lose it silently.
         let topics = test_topics();
         let (client, _rx) = test_client(3);
 
@@ -412,9 +413,9 @@ mod tests {
 
     #[tokio::test]
     async fn given_a_shutdown_when_it_runs_then_it_queues_one_retained_offline_message() {
-        // The message the whole handshake exists to deliver: retained, so a
-        // Home Assistant restarting later still learns the bridge is gone, and
-        // QoS 1, so there is an acknowledgement to wait for.
+        // The handshake exists to deliver this message. It is retained, so
+        // a Home Assistant that restarts later still learns the bridge is
+        // gone. It is QoS 1, so an acknowledgement exists to wait for.
         let topics = test_topics();
         let (client, rx) = test_client(REQUEST_CHANNEL_CAPACITY);
         let driver = tokio::spawn(async {});
@@ -431,10 +432,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_a_driver_that_never_finishes_when_shutting_down_then_it_gives_up_and_aborts() {
-        // A driver parked in its reconnect sleep never sees the offline message,
-        // so the handshake cannot complete. Giving up and dropping the
-        // connection is the right outcome: the broker then publishes the last
-        // will, which carries the same retained "offline" payload.
+        // A driver parked in its reconnect sleep never sees the offline
+        // message, so the handshake cannot complete. The correct outcome is
+        // to stop waiting and drop the connection: the broker then
+        // publishes the last will, which carries the same retained
+        // "offline" payload.
         let topics = test_topics();
         let (client, _rx) = test_client(REQUEST_CHANNEL_CAPACITY);
         let driver = tokio::spawn(std::future::pending::<()>());
@@ -478,11 +480,11 @@ mod tests {
 
     #[test]
     fn given_publishes_still_in_flight_when_shutting_down_then_they_are_not_mistaken_for_offline() {
-        // Packet ids are assigned inside the event loop, so the offline
-        // message can only be identified by counting. A SIGTERM arriving while
-        // retained configs are still in flight must not latch onto one of
+        // The event loop assigns the packet ids, so only counting
+        // identifies the offline message. A SIGTERM that arrives while
+        // retained configs are still in flight must not select one of
         // their ids -- the handshake would then wait for an acknowledgement
-        // that had already been and gone.
+        // that already arrived.
         let ledger = Qos1Ledger::default();
         for _ in 0..8 {
             ledger.queued();
@@ -504,9 +506,10 @@ mod tests {
 
     #[test]
     fn given_a_connection_error_when_pending_publishes_are_forgotten_then_attribution_recovers() {
-        // A connection error discards whatever was queued for the old
-        // connection. Otherwise the driver would skip that many outgoing
-        // publishes on the new connection and sail past the offline message.
+        // A connection error discards every publish queued for the old
+        // connection. Without the reset, the driver would skip that many
+        // outgoing publishes on the new connection and miss the offline
+        // message.
         let ledger = Qos1Ledger::default();
         for _ in 0..8 {
             ledger.queued();
@@ -520,9 +523,9 @@ mod tests {
     #[test]
     fn given_qos1_publishes_from_the_state_loop_when_shutting_down_then_the_offline_is_still_found()
     {
-        // The reason the ledger is shared: the state loop queues retained
-        // discovery and availability at QoS 1 too, so the driver alone cannot
-        // count what is ahead of the offline message.
+        // The reason the tasks share the ledger: the state loop also queues
+        // retained discovery and availability at QoS 1, so the driver alone
+        // cannot count what precedes the offline message.
         let (client, _rx) = test_client(REQUEST_CHANNEL_CAPACITY);
         let ledger = Qos1Ledger::default();
         let topics = test_topics();
