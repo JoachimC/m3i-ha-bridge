@@ -93,25 +93,18 @@ payload is the same as before. That is exactly what happens when the bike is
 paused. bluer's `DiscoveryFilter::default()` gets both settings wrong. This is
 why the code sets them explicitly.
 
-### The retired periodic scan restart
+### Duplicate advertisements
 
-Until 2026-08-31 the bridge stopped and restarted the scan every 60 seconds.
-The restart forced BlueZ to report advertisements that it saw as duplicates.
-The discovery filter now requests `DuplicateData: true`, and a measured ride
-confirmed that this makes the restart unnecessary (issue #2):
+The bridge does not restart the scan; one discovery session runs for the
+life of the process. `DuplicateData: true` in the filter makes bluetoothd
+report every received advertisement, also one whose payload is identical to
+the previous one. An identical payload is the normal case for a paused bike.
+Measured rides confirm this behaviour: the update rate stays stable for a
+full ride and through the paused phase (issues #2 and #3 record the
+numbers).
 
-- Baseline with the restart (2026-08-29, 1,008 updates): mean gap 2.93 s,
-  p95 5.9 s, max 25.5 s. Each restart dropped 1-7 packets.
-- Restart disabled (2026-08-31, 366 updates over 14.5 min): mean gap 2.39 s,
-  p95 3.9 s, max 7.8 s. The first and the last five minutes had the same
-  mean gap (2.41 s), so the update rate did not decay. After the ride,
-  `status="PAUSED"` updates continued every ~2 s. The paused payload does
-  not change between packets, so this confirmed that BlueZ reports
-  duplicates without a restart.
-
-The restart also cleared the per-device subscription set as a side effect.
-An explicit cap (`MAX_SUBSCRIPTIONS` in `src/scan_bluer.rs`) now bounds that
-set instead.
+An explicit cap (`MAX_SUBSCRIPTIONS` in `src/scan_bluer.rs`) bounds the
+per-device subscription set.
 
 If you are not sure that the radio receives the packets, run `sudo btmon` on
 the Pi. It shows what the radio receives, independent of the bridge. Compare

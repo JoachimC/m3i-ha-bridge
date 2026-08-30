@@ -279,25 +279,11 @@ The script downloads the build with the `gh` CLI. It makes sure that the checksu
 
 ## Raspberry Pi Bluetooth Configuration
 
-The adapter must be LE-only, or BlueZ interleaves LE scanning with classic-Bluetooth inquiry and the radio misses ~50% of the bike's advertisements in ~8-second deaf periods.
+The bridge needs no changes to `/etc/bluetooth/main.conf`. The bridge itself requests an LE-only scan (`DiscoveryTransport::Le` in `scan_bluer.rs`). Without an LE-only scan, BlueZ interleaves LE scanning with classic-Bluetooth inquiry, and the radio misses ~50% of the bike's advertisements in ~8-second deaf periods.
 
-The bridge now requests `DiscoveryTransport::Le` itself (`scan_bluer.rs`), which achieves the same thing per-client, so this setting should be redundant. Keep it anyway until that has been confirmed on the hardware: `main.conf` is a global guarantee, whereas BlueZ merges the discovery filters of *all* D-Bus clients, so another client asking for `auto` would reinstate interleaved discovery for everyone.
+One caution: BlueZ merges the discovery filters of *all* D-Bus clients. If another client scans with `auto` transport, interleaved discovery returns for everyone. On a dedicated Pi, the bridge is the only scan client, so this does not occur.
 
-To set the adapter to LE-only, do these steps once on the Pi:
-
-1. Open `/etc/bluetooth/main.conf` with `sudo`.
-2. In the `[General]` section, add this line:
-   ```ini
-   [General]
-   ControllerMode = le
-   ```
-3. Save the file.
-4. Restart the Bluetooth service:
-   ```bash
-   sudo systemctl restart bluetooth
-   ```
-
-Measured effect (90 s riding windows, bike advertises every 1.94 s): mean update gap improved from ~3.9 s (worst 7.8 s) to ~2.1 s (worst 4.9 s). The bridge itself is lossless — it logs every advertisement the radio receives (verify with `sudo btmon`).
+The bike advertises every 1.94 s, and a healthy setup shows a mean update gap of ~2.4 s. The bridge logs every advertisement that the radio receives. To check the radio itself, run `sudo btmon` on the Pi and compare its Keiser report count with the journal.
 
 ---
 
