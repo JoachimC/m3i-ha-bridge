@@ -56,9 +56,9 @@ impl BleScanner for BluerScanner {
 ///
 /// - `Auto` on a dual-mode controller makes BlueZ interleave LE scanning with
 ///   classic-Bluetooth inquiry, so the radio is deaf to the bike for seconds at
-///   a time. It is exactly why `ControllerMode = le` has to be set in
-///   `/etc/bluetooth/main.conf` today; stating the transport here puts the
-///   requirement in code, where re-imaging an SD card cannot lose it.
+///   a time. This filter is the only LE-only control: the Pi's
+///   `/etc/bluetooth/main.conf` sets no `ControllerMode`, and a measured ride
+///   confirms that the filter alone keeps the update rate healthy (issue #3).
 /// - `duplicate_data: false` lets bluetoothd suppress a `ManufacturerData`
 ///   signal whose payload is unchanged — which is precisely the paused-bike
 ///   case. It is also load-bearing a layer down: a filter with no other
@@ -129,12 +129,11 @@ fn scan_stream(
 
 /// Upper bound on live per-device subscriptions.
 ///
-/// The retired periodic scan restart cleared the set every 60 s as a side
-/// effect (issue #2). Without it, the set grows with every distinct BLE
-/// device that the radio hears, so an explicit cap must bound it.
-/// `DeviceRemoved` events free slots when BlueZ purges a device. Generous
-/// for a home: hitting it means an abnormal radio environment, and the
-/// warning in `try_subscribe` makes that visible in the journal.
+/// The set grows with every distinct BLE device that the radio hears, and
+/// the scan runs for the life of the process, so this cap bounds the set.
+/// `DeviceRemoved` events free slots when BlueZ purges a device. The cap is
+/// generous for a home: hitting it means an abnormal radio environment, and
+/// the warning in `try_subscribe` makes that visible in the journal.
 const MAX_SUBSCRIPTIONS: usize = 128;
 
 /// Per-device subscriptions, fanned out in-process from the session's single
@@ -262,7 +261,7 @@ mod tests {
     #[test]
     fn given_max_subscriptions_when_one_more_device_appears_then_the_set_is_full() {
         // Without the cap, the set grows with every distinct BLE device for
-        // the life of the process, now that no scan restart clears it.
+        // the life of the process.
         let mut subscriptions = DeviceSubscriptions::default();
         for i in 0..MAX_SUBSCRIPTIONS {
             subscriptions.subscribed.insert(distinct_address(i));
