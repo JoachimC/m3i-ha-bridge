@@ -18,7 +18,7 @@ set -e
 # The script places the binary in that user's home directory as
 # m3i-ha-bridge-static, where install-service.sh expects it.
 TARGET=arm-unknown-linux-musleabihf
-PI="${PI:-pi@m3i-bridge.local}"
+PI="${PI:-admin@m3i-bridge.local}"
 BINARY_NAME=m3i-ha-bridge-static
 
 if [ "${1:-}" = "--release" ]; then
@@ -54,11 +54,23 @@ else
   BINARY="target/$TARGET/release/m3i-ha-bridge"
 fi
 
-echo "=== 2. Stopping existing bridge and preparing target on $PI ==="
-ssh "$PI" "sudo killall $BINARY_NAME || true && rm -f ~/$BINARY_NAME || true"
+echo "=== 2. Stopping the bridge on $PI ==="
+# The running service holds the binary open, and scp cannot overwrite a
+# running executable. Stop the service first; without the service, stop a
+# foreground bridge process.
+ssh "$PI" "sudo systemctl stop m3i-ha-bridge 2>/dev/null || sudo killall $BINARY_NAME || true; rm -f ~/$BINARY_NAME"
 
 echo "=== 3. Transferring binary to $PI ==="
 scp "$BINARY" "$PI:$BINARY_NAME"
 
-echo "=== 4. Executing bridge on $PI ==="
-ssh -t "$PI" "chmod +x ./$BINARY_NAME && sudo RUST_LOG=info ./$BINARY_NAME"
+echo "=== 4. Starting the bridge on $PI ==="
+# A Pi with the installed service runs the new binary under systemd, and the
+# journal shows the startup. A Pi without the service runs the binary in the
+# foreground, so the log is visible in this terminal.
+if ssh "$PI" "systemctl cat m3i-ha-bridge.service > /dev/null 2>&1"; then
+  ssh "$PI" "chmod +x ./$BINARY_NAME && sudo systemctl start m3i-ha-bridge"
+  sleep 3
+  ssh "$PI" "systemctl is-active m3i-ha-bridge && journalctl -u m3i-ha-bridge -o short-iso -n 5 --no-pager"
+else
+  ssh -t "$PI" "chmod +x ./$BINARY_NAME && sudo RUST_LOG=info ./$BINARY_NAME"
+fi

@@ -237,11 +237,11 @@ History recorded against the old entity ids is not carried over.
 Use `./deploy.sh` to send a build from your development machine to the Pi. The script does these steps:
 
 1. It builds the static release binary for the Pi (`arm-unknown-linux-musleabihf`). The build needs [`cross`](https://github.com/cross-rs/cross) and Docker.
-2. It stops the bridge on the Pi, if the bridge runs.
+2. It stops the `m3i-ha-bridge` service on the Pi, if the service exists. If not, it stops a foreground bridge process.
 3. It copies the binary to the Pi with `scp`. The file goes to the home directory of the ssh user, as `m3i-ha-bridge-static`.
-4. It starts the binary in the foreground, so that you can see the log.
+4. It starts the service again and shows the last journal lines. On a Pi without the service, it starts the binary in the foreground instead, so that you can see the log.
 
-The default ssh target is `pi@m3i-bridge.local`. To use a different user or host, set `PI`:
+The default ssh target is `admin@m3i-bridge.local`. To use a different user or host, set `PI`:
 
 ```bash
 PI=pi@bike.local ./deploy.sh
