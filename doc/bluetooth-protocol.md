@@ -76,9 +76,7 @@ packet
 
 On Linux (BlueZ through `bluer`), the bridge scans continuously. The bike is a
 BLE beacon: while a rider pedals, it advertises its current state without
-stop. The OS can remove advertising packets that it thinks are duplicates. To
-prevent this, the bridge restarts the scan every 60 seconds
-(`SCAN_RESTART_INTERVAL` in `src/bluetooth_hal.rs`).
+stop.
 
 The bridge acts only on a change of the `ManufacturerData` property. This is
 the one signal that carries a new advertisement. The bridge ignores
@@ -95,54 +93,25 @@ payload is the same as before. That is exactly what happens when the bike is
 paused. bluer's `DiscoveryFilter::default()` gets both settings wrong. This is
 why the code sets them explicitly.
 
-### Check if the periodic scan restart is still necessary
+### The retired periodic scan restart
 
-The restart is older than two changes that can make it unnecessary:
+Until 2026-08-31 the bridge stopped and restarted the scan every 60 seconds.
+The restart forced BlueZ to report advertisements that it saw as duplicates.
+The discovery filter now requests `DuplicateData: true`, and a measured ride
+confirmed that this makes the restart unnecessary (issue #2):
 
-- The discovery filter requests `DuplicateData: true`. bluetoothd must then
-  report *every* received advertisement, also identical ones.
-- The adapter runs LE-only.
+- Baseline with the restart (2026-08-29, 1,008 updates): mean gap 2.93 s,
+  p95 5.9 s, max 25.5 s. Each restart dropped 1-7 packets.
+- Restart disabled (2026-08-31, 366 updates over 14.5 min): mean gap 2.39 s,
+  p95 3.9 s, max 7.8 s. The first and the last five minutes had the same
+  mean gap (2.41 s), so the update rate did not decay. After the ride,
+  `status="PAUSED"` updates continued every ~2 s. The paused payload does
+  not change between packets, so this confirmed that BlueZ reports
+  duplicates without a restart.
 
-To check, do these steps:
-
-1. Disable the restart. In `src/bluetooth_hal.rs`, set `SCAN_RESTART_INTERVAL`
-   to a value that does not occur during a test ride. Example:
-   `Duration::from_secs(24 * 60 * 60)`.
-2. Build and deploy the change with `./deploy.sh`.
-3. Ride for at least 10 minutes.
-4. Measure the gaps between updates. Run this command on your development
-   machine:
-
-   ```bash
-   ssh "$PI" "sudo journalctl -u m3i-ha-bridge --since '-15 min' --no-pager \
-     | grep -E 'Bike [0-9]+ Update' | grep -oE '20[0-9-]+T[0-9:.]+' | python3 -c \"
-   import sys, datetime
-   ts = [datetime.datetime.fromisoformat(l.strip()) for l in sys.stdin]
-   gaps = [round((b - a).total_seconds(), 1) for a, b in zip(ts, ts[1:])]
-   print('updates:', len(ts), 'mean gap:', round(sum(gaps) / len(gaps), 2), 'max gap:', max(gaps))
-   \""
-   ```
-
-   Compare the result with the healthy baseline. The baseline was measured on
-   2026-07-18 *with* the restart active: mean gap approximately 2.1 s, maximum
-   gap approximately 5 s. The bike advertises every 1.94 s.
-5. Compare the first five minutes of the ride with the last five minutes. Do
-   not compare only the overall mean. The failure that the restart prevents is
-   decay: updates come at first, then become slower or stop as the scan
-   continues.
-6. Test the identical-payload case. Stop pedalling at the end of the ride.
-   Make sure that `status="PAUSED"` updates continue to arrive in the journal
-   every 2 s, approximately, while the bike broadcasts its end-of-ride summary.
-   This is the case where BlueZ deduplication has an effect. While you ride,
-   the payload changes with every packet (the trip-seconds byte), which hides
-   any deduplication.
-7. Decide:
-   - If the update rate is stable for the full ride and through the paused
-     phase, delete the restart timer. It is the `scan_restart_timer` branch of
-     the `select!` in `create_bluetooth_event_stream`.
-   - If updates stop until the time when a restart would have occurred, set
-     `SCAN_RESTART_INTERVAL` back to 60 s. Then write here that the restart is
-     still necessary.
+The restart also cleared the per-device subscription set as a side effect.
+An explicit cap (`MAX_SUBSCRIPTIONS` in `src/scan_bluer.rs`) now bounds that
+set instead.
 
 If you are not sure that the radio receives the packets, run `sudo btmon` on
 the Pi. It shows what the radio receives, independent of the bridge. Compare

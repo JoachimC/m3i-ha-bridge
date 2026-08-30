@@ -16,10 +16,7 @@ use futures_util::stream::{BoxStream, SelectAll, Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::BoxError;
-use crate::ble_scanner::{
-    BleScanner, ReceivedAdvertisement, SCAN_RESTART_INTERVAL, SCAN_SETTLE_DELAY, ScanEvent,
-    ScanStream,
-};
+use crate::ble_scanner::{BleScanner, ReceivedAdvertisement, ScanEvent, ScanStream};
 
 pub struct BluerScanner {
     session: Session,
@@ -96,22 +93,11 @@ fn scan_stream(
 
         let mut subscriptions = DeviceSubscriptions::default();
 
-        let mut scan_restart_timer = tokio::time::interval(SCAN_RESTART_INTERVAL);
-        scan_restart_timer.tick().await;
-
         loop {
             tokio::select! {
                 // Ending the stream is how cancellation is reported; run_bridge
                 // reads it together with the token.
                 _ = cancel_token.cancelled() => break,
-
-                _ = scan_restart_timer.tick() => {
-                    tracing::info!("Periodically restarting scan...");
-                    if let Err(e) = restart_scan(&adapter, &mut discovery, &mut subscriptions).await {
-                        yield ScanEvent::Error(e);
-                        break;
-                    }
-                }
 
                 adapter_event = discovery.next() => {
                     match adapter_event {
@@ -141,13 +127,21 @@ fn scan_stream(
     }
 }
 
+/// Upper bound on live per-device subscriptions.
+///
+/// The retired periodic scan restart cleared the set every 60 s as a side
+/// effect (issue #2). Without it, the set grows with every distinct BLE
+/// device that the radio hears, so an explicit cap must bound it.
+/// `DeviceRemoved` events free slots when BlueZ purges a device. Generous
+/// for a home: hitting it means an abnormal radio environment, and the
+/// warning in `try_subscribe` makes that visible in the journal.
+const MAX_SUBSCRIPTIONS: usize = 128;
+
 /// Per-device subscriptions, fanned out in-process from the session's single
 /// PropertiesChanged match rule: no D-Bus round trip per device, and none per
 /// advertisement.
 ///
-/// Grows with every distinct BLE device seen. The scan restart bounds it as a
-/// side effect, by clearing it; if that restart is ever retired, this needs an
-/// explicit cap or a prune of devices that have produced no Keiser data.
+/// Bounded by [`MAX_SUBSCRIPTIONS`].
 #[derive(Default)]
 struct DeviceSubscriptions {
     events: SelectAll<BoxStream<'static, AddressedDeviceEvent>>,
@@ -163,9 +157,14 @@ impl DeviceSubscriptions {
     /// received. The cost of not doing it is one missed advertisement (~2 s)
     /// per device appearance, well inside the 20 s staleness window.
     async fn try_subscribe(&mut self, adapter: &Adapter, address: Address) {
-        if !self.subscribed.insert(address) {
+        if self.subscribed.contains(&address) {
             return;
         }
+        if self.is_full() {
+            tracing::warn!("Subscription cap of {MAX_SUBSCRIPTIONS} reached; ignoring {address}");
+            return;
+        }
+        self.subscribed.insert(address);
         let events = adapter
             .device(address)
             .inspect_err(|e| tracing::debug!("Cannot open device {address}: {e}"))
@@ -192,6 +191,10 @@ impl DeviceSubscriptions {
         self.subscribed.remove(&address);
     }
 
+    fn is_full(&self) -> bool {
+        self.subscribed.len() >= MAX_SUBSCRIPTIONS
+    }
+
     fn has_any(&self) -> bool {
         !self.events.is_empty()
     }
@@ -199,35 +202,6 @@ impl DeviceSubscriptions {
     async fn next_event(&mut self) -> Option<AddressedDeviceEvent> {
         self.events.next().await
     }
-
-    /// StopDiscovery makes BlueZ delete every temporary, non-connectable
-    /// device — and the M3i is one, it sends ADV_NONCONN_IND — so every
-    /// per-device subscription dies with a restart, and the DeviceRemoved
-    /// signals arrive while no adapter stream is held to observe them. Forget
-    /// all of it and let the fresh discovery re-announce whatever still
-    /// exists; keeping the set would leave the bridge permanently silent
-    /// after the first restart.
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
-}
-
-/// Stops and restarts discovery, keeping the adapter's filter, and forgets
-/// every subscription the stop invalidated.
-///
-/// Replacing the stream is what stops it: dropping bluer's discovery stream
-/// drops the session token, whose spawned task issues StopDiscovery. The settle
-/// delay gives that a chance to land before a new discovery is requested.
-async fn restart_scan(
-    adapter: &Adapter,
-    discovery: &mut DiscoveryStream,
-    subscriptions: &mut DeviceSubscriptions,
-) -> Result<(), BoxError> {
-    subscriptions.clear();
-    *discovery = Box::pin(futures_util::stream::empty());
-    tokio::time::sleep(SCAN_SETTLE_DELAY).await;
-    *discovery = Box::pin(adapter.discover_devices().await?);
-    Ok(())
 }
 
 /// Maps one device event to an advertisement, if it carries one.
@@ -279,6 +253,33 @@ mod tests {
         let defaults = DiscoveryFilter::default();
         assert_eq!(defaults.transport, DiscoveryTransport::Auto);
         assert!(!defaults.duplicate_data);
+    }
+
+    fn distinct_address(i: usize) -> Address {
+        Address::new([0xC0, 0, 0, 0, (i / 256) as u8, (i % 256) as u8])
+    }
+
+    #[test]
+    fn given_max_subscriptions_when_one_more_device_appears_then_the_set_is_full() {
+        // Without the cap, the set grows with every distinct BLE device for
+        // the life of the process, now that no scan restart clears it.
+        let mut subscriptions = DeviceSubscriptions::default();
+        for i in 0..MAX_SUBSCRIPTIONS {
+            subscriptions.subscribed.insert(distinct_address(i));
+        }
+        assert!(subscriptions.is_full());
+    }
+
+    #[test]
+    fn given_a_full_set_when_a_device_is_forgotten_then_a_slot_frees() {
+        // A permanent lockout at the cap would silence a bike that BlueZ
+        // removes and later re-announces; forget() must free its slot.
+        let mut subscriptions = DeviceSubscriptions::default();
+        for i in 0..MAX_SUBSCRIPTIONS {
+            subscriptions.subscribed.insert(distinct_address(i));
+        }
+        subscriptions.forget(distinct_address(0));
+        assert!(!subscriptions.is_full());
     }
 
     #[test]

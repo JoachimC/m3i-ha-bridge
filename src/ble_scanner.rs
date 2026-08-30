@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
 
 use futures_util::stream::Stream;
 use tokio_util::sync::CancellationToken;
@@ -48,20 +47,6 @@ pub trait BleScanner {
         cancel_token: CancellationToken,
     ) -> impl Future<Output = Result<ScanStream, BoxError>> + Send;
 }
-
-/// How often every scanner stops and restarts its scan.
-///
-/// The Bluetooth stack deduplicates advertising packets; restarting the scan
-/// forces duplicates — i.e. fresh readings from a bike whose payload has not
-/// changed — to keep flowing. On Linux, `duplicate_data: true` in the
-/// discovery filter should make this unnecessary, but that has not been
-/// confirmed on the hardware, and retiring it is a separate change with its
-/// own measurement (see `doc/bluetooth-protocol.md`).
-pub const SCAN_RESTART_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Pause between stopping a scan and starting the next, so the stack has
-/// processed the stop before it is asked to start again.
-pub const SCAN_SETTLE_DELAY: Duration = Duration::from_millis(100);
 
 /// Which advertisements are worth a trace line: the first few, so a scan that
 /// starts can be seen to, then one in every hundred. This is the 2 Hz hot
