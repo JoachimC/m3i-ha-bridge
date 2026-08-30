@@ -1,6 +1,6 @@
 //! BLE scanning everywhere except Linux, via btleplug.
 //!
-//! Linux uses bluer instead (`scan_bluer`), so this exists to keep the bridge
+//! Linux uses bluer instead (`scan_bluer`); this module keeps the bridge
 //! runnable on a macOS dev machine, behind the [`BleScanner`] trait.
 
 use std::time::Duration;
@@ -14,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 use crate::BoxError;
 use crate::ble_scanner::{BleScanner, ReceivedAdvertisement, ScanEvent, ScanStream};
 
-/// Pause between stopping a scan and starting the next, so the stack has
-/// processed the stop before it is asked to start again.
+/// The pause between a scan stop and the next start. It gives the stack time
+/// to process the stop before the next start.
 const SCAN_SETTLE_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
@@ -98,8 +98,8 @@ fn to_advertisement(event: CentralEvent) -> Option<ReceivedAdvertisement> {
     }
 }
 
-// btleplug's PeripheralId is opaque and only constructible from a UUID on
-// macOS, which is the platform this scanner is developed on.
+// btleplug's PeripheralId is opaque; only macOS code can construct one from
+// a UUID. macOS is also the dev platform for this scanner.
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
@@ -127,8 +127,7 @@ mod tests {
     #[test]
     fn given_any_other_central_event_when_mapped_then_nothing_is_produced() {
         // Discovery, connection and RSSI events all fire constantly; only
-        // manufacturer data is an advertisement as far as this bridge is
-        // concerned.
+        // manufacturer data counts as an advertisement for this bridge.
         for event in [
             CentralEvent::DeviceDiscovered(some_peripheral()),
             CentralEvent::DeviceUpdated(some_peripheral()),

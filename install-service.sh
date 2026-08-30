@@ -2,7 +2,7 @@
 # Exit immediately if any command fails
 set -e
 
-# Where deploy.sh put the binary: the invoking user's home directory by default.
+# deploy.sh puts the binary in the invoking user's home directory by default.
 # Override with INSTALL_DIR=/opt/m3i-ha-bridge ./install-service.sh
 INSTALL_DIR="${INSTALL_DIR:-$HOME}"
 BINARY="$INSTALL_DIR/m3i-ha-bridge-static"
@@ -52,14 +52,14 @@ else
 echo "$ENV_FILE already exists, leaving it untouched"
 fi
 
-# Unconditionally, and outside the branch above: an env file written by an
-# earlier version of this script is mode 0644 and may still hold a password.
+# Unconditional, and outside the branch above: an existing env file can be
+# mode 0644 and can still hold a password.
 sudo chown root:root "$ENV_FILE"
 sudo chmod 600 "$ENV_FILE"
 
 echo "=== 2. Preparing the credential store ==="
 # systemd >= 253 ships a tmpfiles rule that creates /etc/credstore 0700 root:root.
-# Creating it here means the permissions are also right on Bookworm (systemd 252).
+# This step also makes the permissions correct on Bookworm (systemd 252).
 sudo install -d -m 700 -o root -g root "$CREDSTORE_DIR"
 if [ -f "$PASSWORD_CRED" ]; then
   sudo chown root:root "$PASSWORD_CRED"
@@ -70,12 +70,11 @@ else
   echo "To set one:  sudo sh -c 'umask 077; cat > $PASSWORD_CRED'   # type it, then Ctrl-D"
 fi
 
-# LoadCredential= itself dates to systemd 247, but the bare form used below --
-# which is looked up in /etc/credstore/ and is explicitly non-fatal when the
-# file is absent -- needs >= 251. The absolute-path form is fatal instead: a
-# missing file fails the unit with exit 243, which under Restart=always is a
-# restart loop. That matters because this script writes the unit whether or not
-# a password has been configured.
+# LoadCredential= dates to systemd 247. The bare form below needs >= 251:
+# systemd looks the name up in /etc/credstore/ and does not fail when the file
+# is absent. The absolute-path form is fatal instead: a missing file fails the
+# unit with exit 243, and Restart=always then loops. That matters because this
+# script writes the unit with or without a configured password.
 SYSTEMD_VERSION="$(systemctl --version | awk 'NR==1 {print $2}')"
 SYSTEMD_VERSION="${SYSTEMD_VERSION%%[!0-9]*}"
 if [ "${SYSTEMD_VERSION:-0}" -ge 251 ]; then

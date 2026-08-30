@@ -1,6 +1,6 @@
 //! The bridge proper: reads advertisements from a scanner, decodes the Keiser
-//! ones, and records them in the fleet. Platform-independent, so it is
-//! written once and tested everywhere.
+//! ones, and records them in the fleet. The module is platform-independent:
+//! the code exists once, and its tests run on every platform.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use crate::ble_scanner::{BleScanner, ReceivedAdvertisement, ScanEvent, is_sample
 use crate::keiser::{self, MANUFACTURER_ID};
 use crate::stats::{BikeId, Fleet, KeiserStats, Reading, record_reading};
 
-/// How one bridge attempt ended, for `bridge_loop` to decide what next.
+/// How one bridge attempt ended; `bridge_loop` decides the next step from it.
 #[derive(Debug, PartialEq)]
 pub enum RunStatus {
     Cancelled,
@@ -51,9 +51,9 @@ pub async fn run_bridge<S: BleScanner>(
         }
     }
 
-    // Cancellation is "the stream ended while the token is cancelled", which is
-    // why there is no dedicated Cancelled event: a scanner signals it by
-    // finishing, and every scanner has to handle the token anyway.
+    // Cancellation is "the stream ended while the token is cancelled". Thus
+    // no dedicated Cancelled event exists: a scanner signals cancellation
+    // when it finishes, and every scanner must handle the token anyway.
     if cancel_token.is_cancelled() {
         tracing::info!("Bridge task cancelled.");
         Ok(RunStatus::Cancelled)
@@ -62,10 +62,10 @@ pub async fn run_bridge<S: BleScanner>(
     }
 }
 
-/// Stamps the arrival time here, at the boundary with the radio: the parser
-/// knows nothing about time, and nothing downstream can tell a live
-/// advertisement from bytes replayed out of a cache, so this must only ever
-/// be fed freshly received data.
+/// Stamps the arrival time here, at the boundary with the radio. The parser
+/// knows nothing about time, and nothing downstream can separate a live
+/// advertisement from bytes replayed out of a cache. Callers must give this
+/// function only freshly received data.
 fn handle_advertisement(
     advertisement: &ReceivedAdvertisement,
     fleet_tx: &watch::Sender<Arc<Fleet>>,
@@ -86,9 +86,9 @@ fn keiser_stats_from(
 
     let stats = match keiser::parse(data) {
         Ok(stats) => stats,
-        // An unsupported bike is a persistent condition the operator needs
-        // to see, so it is a warning. A malformed or review-record beacon is
-        // one packet, and the bike sends those at 2 Hz: debug only.
+        // An unsupported bike is a persistent condition that the operator
+        // must see, so it logs as a warning. A malformed or review-record
+        // beacon is one packet, and the bike sends those at 2 Hz: debug only.
         Err(rejection) if rejection.is_unsupported_bike() => {
             tracing::warn!("ignoring Keiser advertisement: {rejection}");
             return None;
@@ -155,9 +155,9 @@ mod tests {
         }
     }
 
-    /// Replays a canned list of events, so `run_bridge` itself is testable on
-    /// every platform without a Bluetooth stack. This is the payoff of putting
-    /// the trait boundary at raw advertisements rather than at parsed stats.
+    /// Replays a fixed list of events, so tests of `run_bridge` run on every
+    /// platform without a Bluetooth stack. This is the benefit of a trait
+    /// boundary at raw advertisements, not at parsed stats.
     struct FakeScanner {
         events: std::sync::Mutex<Option<Vec<ScanEvent>>>,
     }
@@ -230,8 +230,9 @@ mod tests {
 
     #[tokio::test]
     async fn given_a_cancelled_token_when_the_scan_ends_then_the_run_reports_cancellation() {
-        // How every scanner signals cancellation now: end the stream. Reporting
-        // StreamEnded here instead would make bridge_loop retry during shutdown.
+        // Every scanner signals cancellation the same way: it ends the stream.
+        // A StreamEnded report here instead makes bridge_loop retry during
+        // shutdown.
         let scanner = FakeScanner::new(Vec::new());
         let (stats_tx, _stats_rx) = crate::stats::fleet_channel();
         let cancel_token = CancellationToken::new();
@@ -285,18 +286,18 @@ mod tests {
     #[test]
     fn given_the_keiser_manufacturer_id_when_read_then_it_is_the_sig_assigned_value() {
         // 0x0102 is Keiser Corporation in the Bluetooth SIG company_identifiers
-        // registry. Pinned because widening it decodes unrelated devices:
-        // 0x0201 is AR Timing, 0x01AA Geophysical Technology, 0x015E Unikey
-        // Technologies.
+        // registry. The test pins it because a wider match decodes unrelated
+        // devices: 0x0201 is AR Timing, 0x01AA Geophysical Technology, 0x015E
+        // Unikey Technologies.
         assert_eq!(MANUFACTURER_ID, 0x0102);
     }
 
     #[tokio::test]
     async fn given_a_bridge_attempt_ends_when_its_sender_clone_drops_then_the_channel_stays_open() {
-        // `bridge_loop` calls `run_bridge` again after every failure, handing
-        // each attempt its own clone of the sender. That is only sound because
+        // `bridge_loop` calls `run_bridge` again after every failure and gives
+        // each attempt its own clone of the sender. That is safe only because
         // a watch channel closes when the *last* sender drops, not the first.
-        // Moving the sender into `run_bridge` instead of cloning would leave
+        // A move of the sender into `run_bridge`, instead of a clone, leaves
         // every restart publishing into a closed channel, with both consumers
         // already gone.
         let (stats_tx, mut stats_rx) = crate::stats::fleet_channel();
@@ -318,12 +319,12 @@ mod tests {
 
     #[tokio::test]
     async fn given_a_replayed_payload_when_handled_then_it_is_stamped_as_freshly_received() {
-        // Nothing downstream can tell a live advertisement from bytes the
-        // Bluetooth stack replayed out of its cache: whatever reaches
-        // handle_advertisement is stamped as received now. Any code path that
-        // reads cached manufacturer data (BlueZ `properties()`, bluer's
-        // `device.manufacturer_data()`) would silently reset the staleness
-        // clock, and must not feed it.
+        // Nothing downstream can separate a live advertisement from bytes
+        // that the Bluetooth stack replayed out of its cache: everything that
+        // reaches handle_advertisement gets a "received now" stamp. A code
+        // path that reads cached manufacturer data (BlueZ `properties()`,
+        // bluer's `device.manufacturer_data()`) silently resets the staleness
+        // clock, and must not feed this function.
         let (stats_tx, stats_rx) = crate::stats::fleet_channel();
         handle_advertisement(
             &advertisement(MANUFACTURER_ID, &LIVE_CAPTURE),
@@ -399,8 +400,8 @@ mod tests {
 
     #[test]
     fn given_a_bike_id_filter_of_zero_when_another_bike_advertises_then_it_is_ignored() {
-        // Zero is a real ordinal id — it is the deployed bike's — so filtering
-        // on 0 must filter, not mean "unset".
+        // Zero is a real ordinal id — the deployed bike uses it — so a filter
+        // of 0 must filter, and must not mean "unset".
         let data = capture_for_bike(1);
         assert!(
             keiser_stats_from(&manufacturer_data(MANUFACTURER_ID, &data), Some(BikeId(0)))

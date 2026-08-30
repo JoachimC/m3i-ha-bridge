@@ -5,9 +5,10 @@ use std::path::Path;
 
 use super::topics::Topics;
 
-/// Credential name declared by `LoadCredential=mqtt-password` in the systemd
-/// unit. systemd copies the file into a private ramfs and points
-/// `$CREDENTIALS_DIRECTORY` at it, so the password never enters the environment.
+/// Credential name that `LoadCredential=mqtt-password` declares in the
+/// systemd unit. systemd copies the file into a private ramfs and points
+/// `$CREDENTIALS_DIRECTORY` at it, so the password never enters the
+/// environment.
 const PASSWORD_CREDENTIAL: &str = "mqtt-password";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -30,8 +31,8 @@ impl MqttConfig {
         )
     }
 
-    /// The environment lookup and the file reads are both injected so tests
-    /// stay hermetic: no process environment, no disk.
+    /// The caller injects the environment lookup and the file reads, so
+    /// tests stay hermetic: no process environment, no disk.
     pub fn from_lookup(
         lookup: impl Fn(&str) -> Option<String>,
         read_file: impl Fn(&Path) -> io::Result<String>,
@@ -62,16 +63,16 @@ impl MqttConfig {
 /// Resolves the broker password, in order of precedence:
 ///
 /// 1. `MQTT_PASSWORD` — a plain environment variable, for dev and local runs;
-/// 2. the file named by `MQTT_PASSWORD_FILE` — the Docker `*_FILE` secret
+/// 2. the file that `MQTT_PASSWORD_FILE` names — the Docker `*_FILE` secret
 ///    convention, which also works outside systemd;
-/// 3. `$CREDENTIALS_DIRECTORY/mqtt-password` — the systemd credential loaded by
+/// 3. `$CREDENTIALS_DIRECTORY/mqtt-password` — the systemd credential from
 ///    `LoadCredential=mqtt-password` (see `install-service.sh`).
 ///
-/// The credential is the one the deployment uses, because an environment
-/// variable is the wrong place for a secret on this box: it is readable through
-/// `/proc/<pid>/environ` and inherited by every child process, and the bridge
+/// The deployment uses the credential, because an environment variable is
+/// the wrong place for a secret on this box: processes can read it through
+/// `/proc/<pid>/environ`, every child process inherits it, and the bridge
 /// execs `btmgmt`. systemd instead copies the credential into a private,
-/// unswappable directory only this unit can read.
+/// unswappable directory that only this unit can read.
 ///
 /// An empty value at any step counts as unset, exactly as for `MQTT_USERNAME`.
 fn resolve_password(
@@ -91,11 +92,11 @@ fn resolve_password(
     read_password(read_file, &path, PasswordSource::SystemdCredential)
 }
 
-/// Where a password file came from, which decides how loudly its absence is
-/// reported.
+/// Where a password file comes from, which decides the log level for a
+/// missing file.
 #[derive(Debug, Clone, Copy)]
 enum PasswordSource {
-    /// Named explicitly by `MQTT_PASSWORD_FILE`: a missing file is a
+    /// `MQTT_PASSWORD_FILE` names the file explicitly: a missing file is a
     /// misconfiguration worth a warning.
     ConfiguredFile,
     /// systemd exports `CREDENTIALS_DIRECTORY` whenever the unit declares any
@@ -110,11 +111,11 @@ fn read_password(
 ) -> Option<String> {
     match read_file(path) {
         Ok(contents) => {
-            // systemd copies credential files through byte for byte, adding and
-            // stripping nothing, so a trailing newline left by `echo` or an
-            // editor would otherwise become part of the password. Strip it the
-            // way Docker's own `file_env` helper does. Interior whitespace is
-            // preserved — it may well be part of the password.
+            // systemd copies credential files through byte for byte, and
+            // adds and strips nothing, so a trailing newline from `echo` or
+            // an editor would otherwise become part of the password. Strip
+            // it the way Docker's own `file_env` helper does. Keep interior
+            // whitespace — it can be part of the password.
             let password = contents.trim_end_matches(['\r', '\n']);
             if password.is_empty() {
                 tracing::warn!("MQTT password file {} is empty; ignoring", path.display());
@@ -149,9 +150,9 @@ mod tests {
         move |key| map.get(key).map(|v| v.to_string())
     }
 
-    /// In-memory stand-in for the filesystem: a path not in the map reads as
-    /// `NotFound`, which is what both the `*_FILE` and credential paths see
-    /// when nothing has been configured.
+    /// In-memory replacement for the filesystem: a path not in the map reads
+    /// as `NotFound`, which is what both the `*_FILE` and credential paths
+    /// see when nothing is configured.
     fn reader_from<'a>(
         files: &'a HashMap<&'a str, &'a str>,
     ) -> impl Fn(&Path) -> io::Result<String> + 'a {
@@ -243,8 +244,8 @@ mod tests {
 
     #[test]
     fn given_a_password_file_with_inner_spaces_when_read_then_they_are_preserved() {
-        // Only trailing newlines are stripped: spaces may be part of the
-        // password, so trimming them would silently corrupt it.
+        // The code strips only trailing newlines: spaces can be part of the
+        // password, so a trim would corrupt it silently.
         let vars = HashMap::from([("MQTT_PASSWORD_FILE", "/run/secrets/mqtt")]);
         let files = HashMap::from([("/run/secrets/mqtt", " a b \n")]);
         assert_eq!(password_from(&vars, &files).as_deref(), Some(" a b "));
@@ -291,8 +292,9 @@ mod tests {
 
     #[test]
     fn given_an_empty_password_and_a_password_file_when_read_then_the_file_is_used() {
-        // Blanking MQTT_PASSWORD must fall through rather than resolve to an
-        // empty password, matching how every other credential treats "".
+        // A blank MQTT_PASSWORD must continue to the next source rather
+        // than resolve to an empty password, the same way every other
+        // credential treats "".
         let vars = HashMap::from([
             ("MQTT_PASSWORD", ""),
             ("MQTT_PASSWORD_FILE", "/run/secrets/mqtt"),

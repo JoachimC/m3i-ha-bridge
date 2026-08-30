@@ -1,9 +1,9 @@
 //! Advertising policy: which bike the bridge advertises as, when it switches,
 //! what the advertisement contains, and whether it fits.
 //!
-//! Kept free of any BlueZ/bluer dependency so all of it is unit-tested on
-//! every platform; `gatt_server` supplies the [`Advertiser`] that talks to
-//! BlueZ.
+//! This module has no BlueZ/bluer dependency, so unit tests cover all of it
+//! on every platform; `gatt_server` supplies the [`Advertiser`] that
+//! communicates with BlueZ.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -17,17 +17,17 @@ use tokio_util::sync::CancellationToken;
 use crate::BoxError;
 use crate::stats::{BikeId, Fleet};
 
-/// The 16-bit service UUIDs listed in the advertising packet.
+/// The 16-bit service UUIDs in the advertising packet.
 ///
-/// FTMS (0x1826) has to be here, not merely discoverable after connecting:
-/// many clients — Zwift's FTMS pairing screen among them — filter discovery
-/// on the advertised UUID, so a trainer that omits it is simply never
-/// offered, and the pairing flow never gets far enough to read the service
-/// list. FTMS v1.0 §3.1 requires it for that reason. Heart Rate (0x180D) is
-/// advertised for the same reason: Zwift's HR pairing screen filters on it
+/// The packet must list FTMS (0x1826); discovery after connection is not
+/// sufficient. Many clients, for example Zwift's FTMS pairing screen,
+/// filter discovery on the advertised UUID. A trainer that omits it never
+/// appears, and the pairing flow never reads the service list. FTMS v1.0
+/// §3.1 requires it for this reason. The packet lists Heart Rate (0x180D)
+/// for the same reason: Zwift's HR pairing screen filters on it
 /// identically. The characteristic only notifies while the bike reports a
-/// rate, so with no strap the sensor is offered but silent — the usual case
-/// here is a strap being worn.
+/// rate. With no strap, clients see the sensor but it stays silent; a worn
+/// strap is the usual case here.
 pub const ADVERTISED_SERVICE_UUIDS: [u16; 3] = [
     CYCLING_POWER_SERVICE,
     FITNESS_MACHINE_SERVICE,
@@ -43,11 +43,10 @@ pub const fn sig_uuid(short: u16) -> u128 {
     0x0000_0000_0000_1000_8000_0080_5f9b_34fb | ((short as u128) << 96)
 }
 
-/// `btmgmt add-adv` arguments for the same advertisement, for the fallback
-/// used when D-Bus registration fails. Derived from
-/// [`ADVERTISED_SERVICE_UUIDS`] so the two can never list different services
-/// — a divergence would only ever show up on a Pi that is having a bad day.
-/// `-n` advertises the adapter's alias as the local name.
+/// `btmgmt add-adv` arguments for the same advertisement. The bridge uses
+/// them as the fallback when D-Bus registration fails. The function derives
+/// them from [`ADVERTISED_SERVICE_UUIDS`], so the two paths always list the
+/// same services. `-n` advertises the adapter's alias as the local name.
 pub fn btmgmt_add_adv_args() -> Vec<String> {
     let mut args = vec!["add-adv".to_string()];
     for uuid in ADVERTISED_SERVICE_UUIDS {
@@ -58,26 +57,25 @@ pub fn btmgmt_add_adv_args() -> Vec<String> {
     args
 }
 
-/// A legacy (non-extended) BLE advertising packet carries at most 31 bytes of
-/// AD structures. Overrunning it makes BlueZ refuse to register the
-/// advertisement outright, so the budget is worth checking rather than
-/// assuming.
+/// A legacy (non-extended) BLE advertising packet carries at most 31 bytes
+/// of AD structures. If the payload is larger, BlueZ refuses to register
+/// the advertisement. The tests check this budget; they do not assume it.
 pub const LEGACY_ADVERTISING_CAPACITY: usize = 31;
 
 /// Size in bytes of a legacy advertising payload carrying Flags, a Complete
 /// Local Name and the advertised 16-bit Service UUIDs.
 ///
-/// Each AD structure costs a length byte and a type byte on top of its value
-/// (Core Spec CSS Part A §1); BlueZ contributes the 3-byte Flags structure
-/// itself for a discoverable advertisement. This is a conservative worst case:
-/// BlueZ may move the local name into the scan response, which would free 16
+/// Each AD structure adds a length byte and a type byte to its value (Core
+/// Spec CSS Part A §1); BlueZ contributes the 3-byte Flags structure itself
+/// for a discoverable advertisement. This is a conservative worst case:
+/// BlueZ can move the local name into the scan response, and that frees 16
 /// bytes here.
 pub fn legacy_advertising_size(local_name: &str, uuid16_count: usize) -> usize {
     ad_structure_size(1) + ad_structure_size(local_name.len()) + ad_structure_size(2 * uuid16_count)
 }
 
-/// An empty AD structure is omitted entirely rather than emitted with a
-/// zero-length value.
+/// An empty AD structure has size zero: the packet omits it and does not
+/// contain a zero-length structure.
 fn ad_structure_size(value_len: usize) -> usize {
     const AD_HEADER: usize = 2; // length byte + type byte
     if value_len == 0 {
@@ -87,28 +85,29 @@ fn ad_structure_size(value_len: usize) -> usize {
     }
 }
 
-/// How long the latest bike id has to stay the same before the advertisement
-/// is re-registered under it.
+/// How long the latest bike id must stay the same before the bridge
+/// re-registers the advertisement under it.
 ///
-/// Re-registering is not free: BlueZ tears the old advertisement down, and
-/// clients mid-pairing lose the device. In a room where two bikes alternate
-/// packets, the "latest" id flips every couple of seconds; the hold means the
-/// name only changes when a different bike has genuinely taken over.
+/// Re-registration has a cost: BlueZ removes the old advertisement, and
+/// clients that are mid-pairing lose the device. In a room where two bikes
+/// alternate packets, the "latest" id changes every few seconds. The hold
+/// makes sure that the name only changes when a different bike has really
+/// replaced the current one.
 pub const ADVERTISED_ID_HOLD: Duration = Duration::from_secs(10);
 
-/// How recently a candidate bike must have been heard when the hold elapses.
-/// The M3i advertises every ~2 s while it is pedalled, so a bike that has
-/// genuinely taken over is heard well inside this window; one that sent a
-/// single packet and fell silent is not.
+/// How recent the last packet from a candidate bike must be when the hold
+/// elapses. The M3i advertises every ~2 s while a rider pedals it, so the
+/// bridge hears a genuine replacement well inside this window. A bike that
+/// sent one packet and then stopped is outside it.
 pub const CANDIDATE_RECENCY: Duration = Duration::from_secs(5);
 
-/// Decides which bike id the advertisement should carry.
+/// Decides which bike id the advertisement carries.
 ///
-/// The first bike heard is advertised at once — before it there is nothing to
-/// advertise. After that, a different id replaces the advertised one only when
-/// it has been heard for at least [`ADVERTISED_ID_HOLD`] and is still being
-/// heard (within [`CANDIDATE_RECENCY`]) — a bike that has taken over, rather
-/// than one that sent a stray packet.
+/// The tracker accepts the first bike immediately; before it, there is
+/// nothing to advertise. After that, a different id replaces the advertised
+/// one only when the bridge heard it for at least [`ADVERTISED_ID_HOLD`]
+/// and still hears it (within [`CANDIDATE_RECENCY`]). That is a bike that
+/// replaced the current one, not a bike that sent a stray packet.
 #[derive(Debug, Default)]
 pub struct AdvertisedIdTracker {
     advertised: Option<BikeId>,
@@ -141,8 +140,8 @@ impl AdvertisedIdTracker {
         }
     }
 
-    /// The id the advertisement should switch to now, if any. Calling this
-    /// commits the switch, so the caller must go on to register it.
+    /// The id the advertisement must switch to now, if any. A call commits
+    /// the switch, so the caller must then register it.
     #[must_use = "a due switch is committed; register it"]
     pub fn take_due(&mut self, now: Instant) -> Option<BikeId> {
         let candidate = self.candidate?;
@@ -157,8 +156,8 @@ impl AdvertisedIdTracker {
         Some(candidate.bike_id)
     }
 
-    /// When the current candidate's hold elapses, so the caller can sleep
-    /// until then rather than poll. `None` when nothing is pending.
+    /// The time when the current candidate's hold elapses. The caller can
+    /// sleep until then instead of polling. `None` when nothing is pending.
     pub fn next_deadline(&self) -> Option<Instant> {
         let candidate = self.candidate?;
         Some(if self.advertised.is_none() {
@@ -173,22 +172,22 @@ impl AdvertisedIdTracker {
     }
 }
 
-/// Lets only readings that actually arrived through to the advertising
-/// tracker.
+/// Passes only readings that really arrived to the advertising tracker.
 ///
-/// The watch channel re-delivers its current snapshot on every poll timeout so
-/// consumers can watch a reading go stale. For the tracker that is poison: a
-/// single packet from a neighbouring bike, re-delivered once a second while
-/// the advertised bike's rider coasts, would look like that bike being
-/// present for the whole hold and steal the advertisement. A bike counts as
-/// sighted only when its reading's receive timestamp has changed.
+/// The watch channel delivers its current snapshot again on every poll
+/// timeout, so consumers can watch a reading become stale. That behaviour
+/// is dangerous for the tracker. A single packet from a nearby bike can
+/// arrive again once a second while the advertised bike's rider coasts.
+/// The tracker would then see that bike as present for the whole hold, and
+/// the bike would take the advertisement. A bike counts as sighted only
+/// when its reading's receive timestamp changes.
 #[derive(Debug, Default)]
 pub struct NewArrivals {
     seen: BTreeMap<BikeId, std::time::Instant>,
 }
 
 impl NewArrivals {
-    /// The bikes whose reading in `fleet` has not been seen before.
+    /// The bikes whose reading in `fleet` is new to this filter.
     pub fn new_in(&mut self, fleet: &Fleet) -> Vec<BikeId> {
         fleet
             .iter()
@@ -200,13 +199,14 @@ impl NewArrivals {
     }
 }
 
-/// Something that can put one advertisement on the air at a time.
+/// Something that can broadcast one advertisement at a time.
 ///
-/// Written as desugared RPITITs rather than `async fn` so the `Send` bounds
-/// on the returned futures are explicit.
+/// The trait uses desugared RPITITs instead of `async fn`, so the `Send`
+/// bounds on the returned futures are explicit.
 pub trait Advertiser {
-    /// Registers an advertisement under `name`. Called only while nothing is
-    /// advertised: [`track_advertised_bike`] stops the previous one first.
+    /// Registers an advertisement under `name`. The caller calls this only
+    /// while no advertisement is active: [`track_advertised_bike`] stops the
+    /// previous one first.
     fn advertise(&mut self, name: &str) -> impl Future<Output = Result<(), BoxError>> + Send;
 
     /// Unregisters the current advertisement, if any, and returns once the
@@ -214,18 +214,20 @@ pub trait Advertiser {
     fn stop(&mut self) -> impl Future<Output = ()> + Send;
 }
 
-/// Advertises as the bike the fleet says is being ridden, until cancelled.
+/// Advertises as the bike that the fleet reports as ridden, until
+/// cancellation.
 ///
-/// Nothing is advertised until a bike has been heard; the name then carries
-/// that bike's id. `advertised` is updated only after a registration
-/// succeeds, so the DIS serial number and the notify loops never name a bike
-/// that is not on the air. A registration that fails even via the fallback
-/// is returned as an error: it does not heal in-process.
+/// The loop advertises nothing until it hears a bike; the name then carries
+/// that bike's id. The loop updates `advertised` only after a registration
+/// succeeds, so the DIS serial number and the notify loops never name a
+/// bike that is not advertised. A registration that fails, also through the
+/// fallback, returns an error: the condition does not recover in this
+/// process.
 ///
-/// With `locked_to` set, this bridge instance is dedicated to one bike (the
-/// one-bridge-per-bike studio setup): that name goes on the air immediately,
-/// so a rider pairing before pedalling finds the trainer, and nothing ever
-/// changes it.
+/// With `locked_to` set, this bridge instance serves one bike only (the
+/// one-bridge-per-bike studio setup). The loop advertises that name
+/// immediately, so a rider who pairs before pedalling finds the trainer,
+/// and nothing ever changes the name.
 pub async fn track_advertised_bike<A: Advertiser>(
     advertiser: &mut A,
     mut fleet_rx: watch::Receiver<Arc<Fleet>>,
@@ -276,8 +278,8 @@ pub async fn track_advertised_bike<A: Advertiser>(
             _ = cancel_token.cancelled() => break Ok(()),
             changed = fleet_rx.changed() => {
                 if changed.is_err() {
-                    // The producer is gone; keep serving what is registered
-                    // until shutdown.
+                    // The producer is gone. Keep the current advertisement
+                    // active until shutdown.
                     cancel_token.cancelled().await;
                     break Ok(());
                 }
@@ -317,8 +319,8 @@ mod tests {
 
     #[test]
     fn given_the_advertised_services_when_listed_then_every_pairing_screen_filter_is_present() {
-        // Clients filter discovery on the advertised UUID, so a service that
-        // is only discoverable after connecting is never offered.
+        // Clients filter discovery on the advertised UUID, so they never
+        // offer a service that is only discoverable after connection.
         assert!(ADVERTISED_SERVICE_UUIDS.contains(&FITNESS_MACHINE_SERVICE));
         assert!(ADVERTISED_SERVICE_UUIDS.contains(&CYCLING_POWER_SERVICE));
         assert!(ADVERTISED_SERVICE_UUIDS.contains(&HEART_RATE_SERVICE));
@@ -359,8 +361,8 @@ mod tests {
 
     #[test]
     fn given_a_fourth_advertised_service_when_sized_then_there_is_still_headroom() {
-        // Nothing else is advertised today, but knowing one more would fit is
-        // what makes that a choice rather than a constraint.
+        // The packet lists no other service, but one more service fits.
+        // That makes the current list a choice, not a constraint.
         assert!(
             legacy_advertising_size(&BikeId(200).display_name(), 4) <= LEGACY_ADVERTISING_CAPACITY
         );
@@ -368,8 +370,8 @@ mod tests {
 
     #[test]
     fn given_a_name_that_fills_the_packet_when_sized_then_the_limit_is_exceeded() {
-        // Guards the guard: a sizing function that never reports an overrun
-        // would pass the tests above while proving nothing.
+        // This test checks the check: a sizing function that never reports
+        // an overrun would pass the tests above and prove nothing.
         let long_name = "K".repeat(28);
         assert!(legacy_advertising_size(&long_name, 2) > LEGACY_ADVERTISING_CAPACITY);
     }
@@ -381,8 +383,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_no_advertisement_yet_when_the_first_bike_is_heard_then_it_is_due_at_once() {
-        // Nothing is advertised until a bike is heard, so there is nothing to
-        // protect from thrashing: the first id goes out immediately.
+        // The bridge advertises nothing until it hears a bike, so there is
+        // no unwanted switch to prevent: the first id is due immediately.
         let mut tracker = AdvertisedIdTracker::default();
         let now = Instant::now();
         tracker.observe(BikeId(42), now);
@@ -407,9 +409,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_a_lone_packet_from_another_bike_when_the_hold_elapses_then_nothing_is_due() {
-        // Bike 7 sent one packet and fell silent. It was "the latest" for the
-        // whole hold, but it has not taken over — the rider on bike 1 is just
-        // coasting.
+        // Bike 7 sent one packet and then stopped. It was "the latest" for
+        // the whole hold, but it did not replace bike 1: that rider only
+        // coasts.
         let mut tracker = AdvertisedIdTracker::default();
         tracker.observe(BikeId(1), Instant::now());
         let _ = tracker.take_due(Instant::now());
@@ -422,8 +424,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_a_bike_heard_throughout_the_hold_when_it_elapses_then_it_takes_over() {
-        // The genuine switch: bike 7 keeps advertising every 2 s while bike 1
-        // is silent.
+        // The genuine switch: bike 7 advertises every 2 s while bike 1 is
+        // silent.
         let mut tracker = AdvertisedIdTracker::default();
         tracker.observe(BikeId(1), Instant::now());
         let _ = tracker.take_due(Instant::now());
@@ -437,9 +439,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_two_bikes_alternating_when_the_hold_elapses_then_the_name_does_not_flip() {
-        // The multi-bike room: packets from bike 1 and bike 2 interleave every
-        // couple of seconds. Bike 2 never holds the "latest" slot for the full
-        // hold, so the advertisement stays on bike 1 rather than thrashing.
+        // The multi-bike room: packets from bike 1 and bike 2 interleave
+        // every few seconds. Bike 2 never holds the "latest" slot for the
+        // full hold, so the advertisement stays on bike 1 and does not
+        // oscillate.
         let mut tracker = AdvertisedIdTracker::default();
         tracker.observe(BikeId(1), Instant::now());
         let _ = tracker.take_due(Instant::now());
@@ -457,8 +460,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_the_advertised_bike_returns_when_a_candidate_was_pending_then_it_is_dropped() {
-        // Seeing the advertised bike again resets the clock: the next time a
-        // different bike appears it has to earn the full hold from scratch.
+        // A new sighting of the advertised bike resets the clock: the next
+        // different bike must complete the full hold again.
         let mut tracker = AdvertisedIdTracker::default();
         tracker.observe(BikeId(1), Instant::now());
         let _ = tracker.take_due(Instant::now());
@@ -513,9 +516,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn given_a_stray_packet_while_the_rider_coasts_when_the_hold_elapses_then_the_advertisement_stays()
      {
-        // Bike 42 is advertised, its rider stops pedalling, one packet from
-        // bike 7 arrives, and the channel re-delivers the same snapshot once a
-        // second for longer than the hold.
+        // The bridge advertises bike 42, and its rider stops pedalling. One
+        // packet from bike 7 arrives, and the channel delivers the same
+        // snapshot again once a second for longer than the hold.
         let mut arrivals = NewArrivals::default();
         let mut tracker = AdvertisedIdTracker::default();
         let bike_42 = reading_from(42, 150);
@@ -535,7 +538,7 @@ mod tests {
         assert_eq!(tracker.advertised(), Some(BikeId(42)));
     }
 
-    /// Records what the loop asked for, and can be told to fail.
+    /// Records what the loop requested; a test can make the next call fail.
     #[derive(Clone, Default)]
     struct FakeAdvertiser {
         events: Arc<Mutex<Vec<String>>>,
@@ -649,8 +652,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_another_bike_ridden_through_the_hold_when_it_elapses_then_the_loop_switches() {
-        // The invariant the hardware cares about: stop, then advertise, in
-        // that order, and the advertised id changes only once that succeeded.
+        // The important sequence for the hardware: stop, then advertise, in
+        // that order. The advertised id changes only after that succeeds.
         let harness = Harness::start();
         harness.hear(1).await;
         for _ in 0..6 {
@@ -671,9 +674,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_a_candidate_pending_when_no_packet_arrives_then_the_hold_is_still_evaluated() {
-        // The loop must wake at the candidate's deadline on its own; a bike
-        // that is heard right up to the hold and then falls silent for a
-        // moment would otherwise wait for the next unrelated packet.
+        // The loop must wake at the candidate's deadline by itself. Without
+        // that, a bike that the bridge hears until almost the full hold, and
+        // that then pauses for a moment, waits for the next unrelated packet.
         let harness = Harness::start();
         harness.hear(1).await;
         harness.hear(2).await;
@@ -705,8 +708,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_a_locked_bike_when_the_loop_starts_then_it_advertises_before_any_packet() {
-        // The dedicated-bridge case: the name is known from configuration, so
-        // a rider pairing before pedalling must already find the trainer.
+        // The dedicated-bridge case: the configuration supplies the name, so
+        // a rider who pairs before pedalling must already find the trainer.
         let harness = Harness::start_with(Some(BikeId(42)));
         harness.advance(1).await;
         assert_eq!(harness.advertiser.events(), ["advertise Keiser M3i #042"]);
@@ -716,8 +719,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_a_locked_bike_when_another_bike_is_ridden_for_the_hold_then_nothing_switches() {
-        // The reader's filter already drops other bikes; this pins that even a
-        // reading that got through could not move the advertisement.
+        // The reader's filter already drops other bikes. This test shows
+        // that even a reading that passed the filter cannot move the
+        // advertisement.
         let harness = Harness::start_with(Some(BikeId(1)));
         for _ in 0..6 {
             harness.hear(2).await;

@@ -47,9 +47,9 @@ pub(super) fn test_topics() -> Topics {
     test_config().topics
 }
 
-/// Stands in for the event loop: `AsyncClient` is only a handle on
-/// rumqttc's request channel, so a plain `flume` receiver sees exactly what
-/// a publish enqueued, with no broker and no network.
+/// Replaces the event loop: `AsyncClient` is only a handle on rumqttc's
+/// request channel, so a plain `flume` receiver sees exactly what a publish
+/// enqueued, with no broker and no network.
 pub(super) fn test_client(capacity: usize) -> (AsyncClient, flume::Receiver<rumqttc::Request>) {
     let (tx, rx) = flume::bounded(capacity);
     (AsyncClient::from_senders(tx), rx)

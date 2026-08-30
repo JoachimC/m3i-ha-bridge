@@ -6,8 +6,8 @@ on:
   pull_request:
 
 # Read-only by default; the release job below raises this for itself only.
-# Third-party actions are pinned to commit SHAs (the tag is in the comment) so
-# a moved tag cannot change what runs with the release token.
+# The workflow pins third-party actions to commit SHAs (the tag is in the
+# comment) so a moved tag cannot change what runs with the release token.
 permissions:
   contents: read
 
@@ -32,20 +32,20 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       # Deliberately after the tests, and deliberately not --all-targets: this
-      # is the only step that builds without dev-dependencies. `tokio` is
-      # declared with a trimmed feature list, and a dev-dependency (`test-util`,
-      # or a test-only crate's own tokio features) can unify a feature back in,
-      # so a feature the binary actually needs would otherwise go unnoticed
-      # until a release build on the Pi.
+      # is the only step that builds without dev-dependencies. The manifest
+      # declares `tokio` with a trimmed feature list, and a dev-dependency
+      # (`test-util`, or a test-only crate's own tokio features) can re-enable
+      # a feature. Only this step reveals a feature that the binary needs
+      # before a release build on the Pi.
       - run: cargo build
-      # And the only step that exercises the release profile, whose fat LTO and
-      # codegen-units = 1 can surface link errors that a debug build never
-      # reaches. Slow, but cheaper than finding out during a deploy.
+      # The only step that exercises the release profile. Its fat LTO and
+      # codegen-units = 1 can cause link errors that a debug build never
+      # reaches. Slow, but cheaper than a failed deploy.
       - run: cargo build --release
 
-  # The `not(target_os = "linux")` half of the crate — the btleplug scanner,
-  # the platform stubs — is only ever compiled on a dev Mac otherwise, and
-  # rots silently. Not a required check: a macOS runner is slower to queue.
+  # Only a dev Mac otherwise compiles the `not(target_os = "linux")` half of
+  # the crate: the btleplug scanner and the platform stubs. A defect there
+  # stays silent. Not a required check: a macOS runner is slower to queue.
   check-macos:
     runs-on: macos-latest
     steps:
@@ -60,11 +60,11 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
-  # Builds the release binaries and publishes them as one GitHub Release, so
-  # a deploy never depends on whichever working tree happened to be on the dev
-  # machine, and rolling back is "download an earlier tag". One build job per
-  # target, then a single release job: parallel jobs each calling the release
-  # action would race to create the same tag.
+  # Builds the release binaries and publishes them as one GitHub Release. A
+  # deploy then never depends on the working tree of the dev machine, and a
+  # rollback is a download of an earlier tag. One build job per target, then
+  # a single release job: parallel jobs that each call the release action
+  # would race to create the same tag.
   build:
     needs: check
     if: github.ref == 'refs/heads/main'
@@ -79,13 +79,14 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      # Must precede the build: cross bakes this into the binary. Derived from
-      # the commit and the date, so every matrix job computes the same value.
+      # Must precede the build: cross writes this value into the binary. The
+      # value comes from the commit and the date, so every matrix job
+      # computes the same value.
       - name: Compute build version
         run: echo "BUILD_VERSION=$(date -u +%Y-%m-%d)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
       # cross runs the *host* rustup toolchain inside its container (it mounts
-      # the sysroot read-only), so this is what actually compiles edition 2024.
+      # the sysroot read-only), so this toolchain compiles edition 2024.
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
         with:
           toolchain: stable
@@ -93,7 +94,8 @@ jobs:
 
       # cross mounts the host CARGO_HOME and ./target into the container, so
       # container builds do populate the directories this caches. cache-bin is
-      # off so it never fights install-action over ~/.cargo/bin/cross.
+      # off so it does not conflict with install-action over
+      # ~/.cargo/bin/cross.
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           key: ${{ matrix.target }}
@@ -115,8 +117,8 @@ jobs:
           cp "target/${{ matrix.target }}/release/m3i-ha-bridge" "$BIN"
           sha256sum "$BIN" > "$BIN.sha256"
           file "$BIN"
-          # If this prints "dev", Cross.toml's build.env.passthrough is not
-          # reaching the container and every release would be unidentifiable.
+          # If this prints "dev", Cross.toml's build.env.passthrough does not
+          # reach the container, and every release is unidentifiable.
           strings "$BIN" | grep -qF "$BUILD_VERSION" \
             || { echo "::error::BUILD_VERSION was not baked into the binary"; exit 1; }
 
@@ -130,13 +132,13 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
-    # Creating the release needs write access; scoped to this job so every
+    # The release needs write access; the scope is this job only, so every
     # other job keeps the workflow-level read-only token.
     permissions:
       contents: write
     steps:
-      # Only for OSMFEULA.txt, which ships alongside the binaries because the
-      # Maintenance Fee terms attach to the Binary Release, not the source.
+      # Only for OSMFEULA.txt. It ships with the binaries because the
+      # Maintenance Fee terms apply to the Binary Release, not the source.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           sparse-checkout: OSMFEULA.txt
@@ -149,8 +151,8 @@ jobs:
         with:
           merge-multiple: true
 
-      # A build that spanned midnight UTC would have a stale date in the
-      # artifact names; refuse to publish rather than tag the wrong thing.
+      # A build that spans midnight UTC has a stale date in the artifact
+      # names; the step refuses to publish rather than create a wrong tag.
       - name: Check every artifact carries this version
         run: |
           ls -l
@@ -167,18 +169,18 @@ jobs:
           # whatever the branch tip happens to be when the API call lands.
           target_commitish: ${{ github.sha }}
           fail_on_unmatched_files: true
-          # One pattern per asset, with no overlap. The trailing * catches
+          # One pattern per asset, with no overlap. The trailing * matches
           # both the arm "eabihf" suffix and every ".sha256" file. A second
           # pattern that matches the same files makes the action upload each
-          # of them twice, concurrently; the duplicate uploads race, and the
-          # loser dies with a 404 from the update-asset endpoint (issue #48).
+          # of them twice, concurrently. The duplicate uploads race, and one
+          # fails with a 404 from the update-asset endpoint (issue #48).
           files: |
             m3i-ha-bridge-*-unknown-linux-musl*
             OSMFEULA.txt
 
-  # Keeps `rust-version` in Cargo.toml honest. Without this the field is a
-  # guess: the crate builds fine on stable whether the true floor is 1.85 or
-  # 1.88, so only compiling on the declared version proves the claim.
+  # Verifies `rust-version` in Cargo.toml. Without this job the field is a
+  # guess: the crate builds on stable whether the real minimum is 1.85 or
+  # 1.88. Only a compile on the declared version proves the claim.
   msrv:
     runs-on: ubuntu-latest
     steps:

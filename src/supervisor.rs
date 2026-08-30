@@ -1,22 +1,22 @@
-//! Keeps the long-lived tasks running and turns how they ended into the
+//! Keeps the long-lived tasks running and maps how they ended to the
 //! process exit status.
 //!
 //! # Failure policy
 //!
 //! Three long-lived tasks, three deliberately different policies:
 //!
-//! - **Bluetooth reader** — retry forever. An adapter that is missing, wedged
-//!   or being re-initialised comes back on its own, and reading the bike is the
-//!   one thing the process exists to do. [`bridge_loop`] restarts it until
-//!   cancelled.
-//! - **MQTT publisher** — retry forever, internally. rumqttc reconnects on its
-//!   own, so a broker being down must not stop the BLE half of the bridge. Its
-//!   task only ever fails once the reader has stopped for good, so it is
-//!   supervised with [`OnFailure::Report`].
-//! - **GATT server** — fail fast. Its failures are registration and permission
-//!   problems that do not heal by retrying in-process, so it is supervised with
-//!   [`OnFailure::CancelEverything`] and lets systemd's `Restart=always` start
-//!   a clean one.
+//! - **Bluetooth reader** — retry forever. An adapter that is missing, stuck,
+//!   or in re-initialisation recovers on its own, and to read the bike is the
+//!   main purpose of the process. [`bridge_loop`] restarts the reader until
+//!   cancellation.
+//! - **MQTT publisher** — retry forever, internally. rumqttc reconnects on
+//!   its own, so a broker outage must not stop the BLE half of the bridge.
+//!   Its task fails only after the reader stops permanently, so
+//!   [`OnFailure::Report`] supervises it.
+//! - **GATT server** — fail fast. Its failures are registration and
+//!   permission problems, and in-process retries do not correct those.
+//!   [`OnFailure::CancelEverything`] supervises it, and systemd's
+//!   `Restart=always` starts a clean process.
 //!
 //! Whichever ends the process, the exit status reflects it: zero for a signal,
 //! non-zero for a task failure.
@@ -35,21 +35,20 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Delay before the first retry after a reader failure.
 pub const RETRY_DURATION: Duration = Duration::from_secs(5);
-/// Ceiling the retry delay backs off to. A permanent fault costs one log line
-/// a minute instead of twelve.
+/// The maximum backoff delay. With it, a permanent fault costs one log line
+/// each minute instead of twelve.
 pub const MAX_RETRY_DURATION: Duration = Duration::from_secs(60);
-/// How long a reader attempt has to last before it counts as healthy.
-/// Comfortably longer than the time it takes to discover there is no adapter,
-/// and longer than the scan restart interval, so a genuinely working bridge
-/// always qualifies.
+/// Minimum duration of a reader attempt that counts as healthy. It is much
+/// longer than the time to discover that no adapter exists, so a bridge
+/// that works always qualifies.
 pub const HEALTHY_RUN_DURATION: Duration = Duration::from_secs(120);
 
 /// What a task's failure means for the rest of the process.
 #[derive(Debug, Clone, Copy)]
 pub enum OnFailure {
-    /// Log it and take everything down; systemd restarts the process.
+    /// Log it and cancel everything; systemd restarts the process.
     CancelEverything,
-    /// Log it and let the others finish; the exit status will still say.
+    /// Log it and let the others finish; the exit status still reports it.
     Report,
 }
 
@@ -78,14 +77,15 @@ where
 
 /// Awaits a supervised task, returning a description of how it failed.
 ///
-/// Both failure shapes are reported. An `Err` is the task's own reported
-/// failure; a `JoinError` means it panicked or was aborted, which is otherwise
-/// completely invisible — the handle resolves and nothing else notices.
+/// It reports both failure shapes. An `Err` is the task's own reported
+/// failure. A `JoinError` means the task panicked or an abort stopped it;
+/// without this report that is invisible — the handle resolves and nothing
+/// else notices.
 ///
-/// Release builds set `panic = "abort"`, so a panicking task takes the process
-/// down before this can observe it; there the restart *is* the report. The
-/// `JoinError` arm still matters for aborted tasks, and in debug and test
-/// builds, which unwind.
+/// Release builds set `panic = "abort"`, so a panic stops the process before
+/// this function can observe it; in that case the restart itself is the
+/// report. The `JoinError` arm still matters for aborted tasks, and in debug
+/// and test builds, which unwind.
 pub async fn join_task(name: &str, handle: JoinHandle<Result<(), BoxError>>) -> Option<String> {
     match handle.await {
         Ok(Ok(())) => None,
@@ -96,9 +96,9 @@ pub async fn join_task(name: &str, handle: JoinHandle<Result<(), BoxError>>) -> 
 
 /// Turns the supervised tasks' outcomes into the process exit status.
 ///
-/// Exiting zero after a task failure is a lie that costs real debugging time:
-/// `Restart=always` masks it, so `systemctl status` shows a clean exit and the
-/// journal is the only evidence anything went wrong.
+/// A zero exit after a task failure hides the failure and costs debugging
+/// time: `Restart=always` masks it, `systemctl status` shows a clean exit,
+/// and the journal is the only evidence of the fault.
 pub fn exit_status(failures: Vec<String>) -> Result<(), BoxError> {
     if failures.is_empty() {
         return Ok(());
@@ -106,8 +106,8 @@ pub fn exit_status(failures: Vec<String>) -> Result<(), BoxError> {
     Err(failures.join("; ").into())
 }
 
-/// Runs the reader until cancelled, restarting it after every failure or
-/// stream end with the delay the strategy decides.
+/// Runs the reader until cancellation. After every failure or stream end, it
+/// restarts the reader with the delay that the strategy decides.
 pub async fn bridge_loop<F, Fut, S>(
     mut run_bridge_fn: F,
     cancel_token: CancellationToken,
@@ -140,8 +140,7 @@ mod tests {
     use crate::stats;
     use std::sync::{Arc, Mutex};
 
-    /// Waits for nothing, but records what each attempt was reported as
-    /// having lasted.
+    /// Waits for nothing, but records the reported duration of each attempt.
     #[derive(Default)]
     struct RecordingDelay {
         attempts: Arc<Mutex<Vec<Duration>>>,
@@ -163,7 +162,8 @@ mod tests {
     }
 
     /// Runs `bridge_loop` over attempts that each last `attempt_duration` and
-    /// then fail, stopping after two, and reports what the strategy was told.
+    /// then fail. It stops after two attempts and reports the durations that
+    /// the loop gave the strategy.
     async fn attempt_durations_reported_for(attempt_duration: Duration) -> Vec<Duration> {
         let delay = no_delay();
         let attempts = delay.attempts.clone();
@@ -227,8 +227,8 @@ mod tests {
 
     #[tokio::test]
     async fn given_a_task_that_panicked_when_joined_then_the_failure_is_reported() {
-        // Otherwise completely invisible: the JoinHandle resolves to a
-        // JoinError, the task is gone, and nothing else notices.
+        // Without this report the panic is invisible: the JoinHandle resolves
+        // to a JoinError, the task is gone, and nothing else notices.
         let handle = tokio::spawn(async { panic!("notify loop died") });
         let failure = join_task("GATT server", handle).await.expect("a failure");
         assert!(failure.contains("GATT server"), "{failure}");
@@ -279,15 +279,15 @@ mod tests {
 
     #[test]
     fn given_no_failures_when_the_exit_status_is_computed_then_it_is_success() {
-        // A signal-driven shutdown: every task ended cleanly, so systemd should
-        // see a clean exit.
+        // A signal-driven shutdown: every task ended cleanly, so systemd sees
+        // a clean exit.
         assert!(exit_status(Vec::new()).is_ok());
     }
 
     #[test]
     fn given_a_failure_when_the_exit_status_is_computed_then_it_is_an_error() {
-        // Exiting Ok(()) after the GATT server failed and tore the process
-        // down would make `systemctl status` report success after a crash.
+        // An Ok(()) exit after the GATT server failed and stopped the
+        // process makes `systemctl status` report success after a crash.
         let status = exit_status(vec!["GATT server failed: no adapter".to_string()]);
         assert!(status.is_err());
         assert!(status.unwrap_err().to_string().contains("no adapter"));
@@ -295,8 +295,8 @@ mod tests {
 
     #[test]
     fn given_several_failures_when_the_exit_status_is_computed_then_all_are_reported() {
-        // Two tasks can fail from one cause -- losing the Bluetooth adapter
-        // takes the GATT server down and the producer with it -- and the second
+        // Two tasks can fail from one cause: the loss of the Bluetooth
+        // adapter stops the GATT server and the producer with it. The second
         // failure is often the more informative one.
         let status = exit_status(vec![
             "GATT server failed: no adapter".to_string(),
@@ -311,8 +311,8 @@ mod tests {
     async fn given_the_bridge_loop_owns_the_last_sender_when_it_returns_then_the_channel_closes() {
         // What makes the publishers' "producer gone" branches reachable: main
         // moves its only sender into the wrapper, and bridge_loop takes the
-        // wrapper by value. Holding a sender in main would keep the channel
-        // open forever and turn those branches into dead code.
+        // wrapper by value. A sender kept in main holds the channel open
+        // forever and makes those branches dead code.
         let (stats_tx, mut stats_rx) = stats::fleet_channel();
         let cancel_token = CancellationToken::new();
         let token_clone = cancel_token.clone();
