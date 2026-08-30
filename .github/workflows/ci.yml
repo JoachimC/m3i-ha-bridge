@@ -167,9 +167,13 @@ jobs:
           # whatever the branch tip happens to be when the API call lands.
           target_commitish: ${{ github.sha }}
           fail_on_unmatched_files: true
+          # One pattern per asset, with no overlap. The trailing * catches
+          # both the arm "eabihf" suffix and every ".sha256" file. A second
+          # pattern that matches the same files makes the action upload each
+          # of them twice, concurrently; the duplicate uploads race, and the
+          # loser dies with a 404 from the update-asset endpoint (issue #48).
           files: |
             m3i-ha-bridge-*-unknown-linux-musl*
-            m3i-ha-bridge-*.sha256
             OSMFEULA.txt
 
   # Keeps `rust-version` in Cargo.toml honest. Without this the field is a
