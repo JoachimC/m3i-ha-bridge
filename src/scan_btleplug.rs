@@ -3,6 +3,8 @@
 //! Linux uses bluer instead (`scan_bluer`), so this exists to keep the bridge
 //! runnable on a macOS dev machine, behind the [`BleScanner`] trait.
 
+use std::time::Duration;
+
 use async_stream::stream;
 use btleplug::api::{Central, CentralEvent, Manager as _, ScanFilter};
 use btleplug::platform::{Adapter, Manager};
@@ -10,10 +12,11 @@ use futures_util::stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::BoxError;
-use crate::ble_scanner::{
-    BleScanner, ReceivedAdvertisement, SCAN_RESTART_INTERVAL, SCAN_SETTLE_DELAY, ScanEvent,
-    ScanStream,
-};
+use crate::ble_scanner::{BleScanner, ReceivedAdvertisement, ScanEvent, ScanStream};
+
+/// Pause between stopping a scan and starting the next, so the stack has
+/// processed the stop before it is asked to start again.
+const SCAN_SETTLE_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 pub struct BtleplugScanner;
@@ -56,21 +59,9 @@ fn scan_stream(
             return;
         }
 
-        let mut scan_restart_timer = tokio::time::interval(SCAN_RESTART_INTERVAL);
-        scan_restart_timer.tick().await;
-
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
-                _ = scan_restart_timer.tick() => {
-                    tracing::info!("Periodically restarting scan...");
-                    let _ = central.stop_scan().await;
-                    tokio::time::sleep(SCAN_SETTLE_DELAY).await;
-                    if let Err(e) = central.start_scan(filter.clone()).await {
-                        yield ScanEvent::Error(e.into());
-                        break;
-                    }
-                }
                 next_event = events.next() => {
                     match next_event {
                         Some(event) => {
